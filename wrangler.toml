@@ -1,0 +1,11 @@
+name = "subconvertion"
+main = "src/worker.js"
+compatibility_date = "2024-11-05"
+workers_dev = true
+
+[vars]
+BACKEND = "https://api.dler.io"
+
+[[r2_buckets]]
+binding = "SUB_BUCKET"
+bucket_name = "sub"
