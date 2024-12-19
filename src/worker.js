@@ -166,25 +166,24 @@ const src_default = {
 				// 此处拿到的可能是yaml数据,如果是yaml数据,则把placeholderNodes添加到yaml数据中的proxies字段中
 				try {
 					const config = jsYaml.load(result);
-					if (!config.proxies) {
-						config.proxies = [];
-					}
-					const placeholderNode = {name: '🚫 无可用节点', server: 'a.com', port: 47119, type: 'trojan', password: '8e3ff4d9-79c7-4bcc-a6d6-46f8795ffake', sni: 'b.com', 'skip-cert-verify': true, udp: true};
-					config.proxies.push(placeholderNode);
-					// 检查所有的proxy-groups, 如果哪个proxy-group下的proxies字段为空或者只包含DIRECT,则添加一个假的节点
-					if (config["proxy-groups"]) {
-						config["proxy-groups"].forEach((group) => {
-							if(!group.proxies) {
-								group.proxies = [];
-							}
-							if (group.proxies.length === 1 && group.proxies[0] === "DIRECT") {
-								// remove it first
-								group.proxies = [];
-							}
-							if (group.proxies.length === 0) {
-								group.proxies.push(placeholderNode.name);
-							}
-						});
+					if (config.proxies?.length) {
+						const callbackNode = { ...config.proxies[0], name: '🚥‼️ 通用节点' };
+						config.proxies.push(callbackNode);
+						// 检查所有的proxy-groups, 如果哪个proxy-group下的proxies字段为空或者只包含DIRECT,则添加一个假的节点
+						if (config["proxy-groups"]) {
+							config["proxy-groups"].forEach((group) => {
+								if(!group.proxies) {
+									group.proxies = [];
+								}
+								if (group.proxies.length === 1 && group.proxies[0] === "DIRECT") {
+									// remove it first
+									group.proxies = [];
+								}
+								if (group.proxies.length === 0) {
+									group.proxies.push(callbackNode.name);
+								}
+							});
+						}
 					}
 					const resultNew = jsYaml.dump(config);
 					return new Response(resultNew, rpResponse);
