@@ -132,9 +132,6 @@ const src_default = {
       await SUB_BUCKET.delete(key + "_headers");
     }
     if (rpResponse.status === 200) {
-			// 生成一些假的节点数据，避免客户端报错. 节点格式: {name: 香港-placeholder, server: wb.kaiqsz.com, port: 47119, type: trojan, password: 8e3ff4d9-79c7-4bcc-a6d6-46f8795ffake, sni: mm1.redapricotcloud.com, 'skip-cert-verify': true, udp: true}
-			// 常见地区每个地区一个节点, 地区: 美国,日本,新加坡,香港,德国,荷兰,澳大利亚,加拿大,土耳其,越南,英国,台湾,韩国,印度,法国
-			const placeholderNodes = getPlaceholderNodes();
 
 			// receive the response from the subConverter endpoint, and recover the original data
       const plaintextData = await rpResponse.text();
@@ -153,9 +150,6 @@ const src_default = {
           if (newLink)
             newLinks.push(newLink);
         }
-				for (const node of placeholderNodes) {
-					newLinks.push(`trojan://${node.server}:${node.port}?allowInsecure=1&peer=${node.server}&sni=${node.sni}#${node.name}`);
-				}
         const replacedBase64Data = btoa(newLinks.join("\r\n"));
         return new Response(replacedBase64Data, rpResponse);
       } catch (base64Error) {
@@ -167,7 +161,7 @@ const src_default = {
 				try {
 					const config = jsYaml.load(result);
 					if (config.proxies?.length) {
-						const callbackNode = { ...config.proxies[0], name: '🚥‼️ 通用节点' };
+						const callbackNode = { ...config.proxies[0], name: '🚥‼️ 临替节点' };
 						config.proxies.push(callbackNode);
 						// 检查所有的proxy-groups, 如果哪个proxy-group下的proxies字段为空或者只包含DIRECT,则添加一个假的节点
 						if (config["proxy-groups"]) {
@@ -175,7 +169,7 @@ const src_default = {
 								if(!group.proxies) {
 									group.proxies = [];
 								}
-								if (group.proxies.length === 1 && group.proxies[0] === "DIRECT") {
+								if (!group.name?.includes('全球直连') && group.proxies.length === 1 && group.proxies[0] === "DIRECT") {
 									// remove it first
 									group.proxies = [];
 								}
