@@ -77,13 +77,18 @@ const src_default = {
 				let suffix = url.searchParams.get('suffix') || '';
         if (url2.startsWith("https://") || url2.startsWith("http://")) {
 					suffix = new URL(url2).searchParams?.get('suffix') || suffix;
+          const fetchHeaders = new Headers(request.headers);
+          fetchHeaders.set('User-Agent', 'ClashX Pro/1.118.1.1 (com.west2online.ClashXPro; build:1.118.1.1; macOS 15.4.1) Alamofire/5.8.0');
           response = await fetch(url2, {
             method: request.method,
-            headers: request.headers,
+            headers: fetchHeaders,
             redirect: 'follow', // https://developers.cloudflare.com/workers/runtime-apis/request#constructor
           });
-          if (!response.ok)
+          if (!response.ok) {
+            const respBody = await response.text();
+            // console.warn(`[subconvertion] Fetch failed: ${url2}, status: ${response.status}, statusText: ${response.statusText}, body: ${respBody}`);
             continue;
+          }
           const plaintextData = await response.text();
           parsedObj = parseData(plaintextData);
           await SUB_BUCKET.put(key + "_headers", JSON.stringify(Object.fromEntries(response.headers)));
@@ -186,7 +191,10 @@ const src_default = {
 					return new Response(result, rpResponse);
 				}
       }
-    }
+    } else {
+			const respBody = await rpResponse.clone().text();
+			// console.error(`[subconvertion] Subscription failed: ${url}, status: ${rpResponse.status}, statusText: ${rpResponse.statusText}, body: ${respBody}`);
+		}
     return rpResponse;
   }
 };

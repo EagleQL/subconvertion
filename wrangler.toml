@@ -10,3 +10,18 @@ BACKEND = "https://api.dler.io"
 [[r2_buckets]]
 binding = "SUB_BUCKET"
 bucket_name = "sub"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = false
+head_sampling_rate = 1
+persist = false
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = false
+head_sampling_rate = 1
