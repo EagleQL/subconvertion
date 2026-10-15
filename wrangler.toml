@@ -5,7 +5,8 @@ workers_dev = true
 compatibility_flags = ["nodejs_compat_v2"]
 
 [vars]
-BACKEND = "https://api.dler.io"
+# 逗号分隔, 按顺序尝试, 前一个失败(非 200 / 超时 / 网络错误)则换下一个
+BACKEND = "https://api.v1.mk,https://subapi.cmliussss.net,https://subapi.fxxk.dedyn.io"
 
 [[r2_buckets]]
 binding = "SUB_BUCKET"

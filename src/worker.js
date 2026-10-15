@@ -6,7 +6,10 @@ const src_default = {
     const host = url.origin;
     const frontendUrl = 'https://raw.githubusercontent.com/bulianglin/psub/main/frontend.html';
     const SUB_BUCKET = env.SUB_BUCKET;
-    let backend = env.BACKEND.replace(/(https?:\/\/[^/]+).*$/, "$1");
+    // BACKEND 支持逗号分隔的多个后端, 按顺序尝试
+    let backends = env.BACKEND.split(",")
+      .map((b) => b.trim().replace(/(https?:\/\/[^/]+).*$/, "$1"))
+      .filter((b) => b.length > 0);
     const subDir = "subscription";
     const pathSegments = url.pathname.split("/").filter((segment) => segment.length > 0);
     if (pathSegments.length === 0) {
@@ -48,7 +51,8 @@ const src_default = {
       return new Response("Missing URL parameter", { status: 400 });
     const backendParam = url.searchParams.get("bd");
     if (backendParam && /^(https?:\/\/[^/]+)[.].+$/g.test(backendParam))
-      backend = backendParam.replace(/(https?:\/\/[^/]+).*$/, "$1");
+      // 指定的后端优先, 失败后仍回落到默认列表
+      backends = [backendParam.replace(/(https?:\/\/[^/]+).*$/, "$1"), ...backends];
     const replacements = {};
     const replacedURIs = [];
     const keys = [];
@@ -130,11 +134,15 @@ const src_default = {
 		// 请求 subConverter 模版转换端点API，获取转换后的数据
     const newUrl = replacedURIs.join("|");
     url.searchParams.set("url", newUrl);
-    const modifiedRequest = new Request(backend + url.pathname + url.search, request);
-    const rpResponse = await fetch(modifiedRequest);
-    for (const key of keys) {
-      await SUB_BUCKET.delete(key);
-      await SUB_BUCKET.delete(key + "_headers");
+    let rpResponse;
+    try {
+      rpResponse = await fetchFromBackends(backends, url.pathname + url.search, request);
+    } finally {
+      // 无论成功与否都清理暂存数据, 避免脱敏数据残留在 R2
+      for (const key of keys) {
+        await SUB_BUCKET.delete(key);
+        await SUB_BUCKET.delete(key + "_headers");
+      }
     }
     if (rpResponse.status === 200) {
 
@@ -198,6 +206,25 @@ const src_default = {
     return rpResponse;
   }
 };
+// 依次请求各后端, 返回第一个 200 的响应; 全部失败时返回最后一个响应(或 502)
+async function fetchFromBackends(backends, pathAndSearch, request) {
+  const BACKEND_TIMEOUT_MS = 15000;
+  let lastResponse;
+  for (const backend of [...new Set(backends)]) {
+    try {
+      const resp = await fetch(new Request(backend + pathAndSearch, request), {
+        signal: AbortSignal.timeout(BACKEND_TIMEOUT_MS),
+      });
+      if (resp.status === 200)
+        return resp;
+      console.warn(`[subconvertion] backend ${backend} returned ${resp.status}, trying next`);
+      lastResponse = resp;
+    } catch (error) {
+      console.warn(`[subconvertion] backend ${backend} failed: ${error}, trying next`);
+    }
+  }
+  return lastResponse || new Response("All backends failed", { status: 502 });
+}
 function replaceInUri(link, replacements, isRecovery, suffix = '') {
   // switch (true) {
   //   case link.startsWith("ss://"):
