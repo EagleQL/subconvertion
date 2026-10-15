@@ -259,7 +259,7 @@ function replaceInUri(link, replacements, isRecovery, suffix = '') {
 			result = replaceTrojan(link, replacements, isRecovery);
 			break;
 		case link.startsWith("hysteria://"):
-			result = replaceHysteria(link, replacements);
+			result = replaceHysteria(link, replacements, isRecovery);
 			break;
 		default:
 			return;
@@ -415,15 +415,29 @@ function replaceTrojan(link, replacements, isRecovery) {
     return link.replace(regex, (match) => cReplace(match, uuid, randomUUID, server, randomDomain));
   }
 }
-function replaceHysteria(link, replacements) {
+function replaceHysteria(link, replacements, isRecovery) {
   const regexMatch = link.match(/hysteria:\/\/(.*):(.*?)\?/);
   if (!regexMatch) {
     return;
   }
   const server = regexMatch[1];
+  const auth = link.match(/[?&]auth=([^&#]+)/)?.[1];
+  if (isRecovery) {
+    // server/auth 此时是脱敏后的值, 换回原始值 (peer 等参数里同名的域名一并还原)
+    let result = link.split(server).join(replacements[server] ?? server);
+    if (auth && replacements[auth])
+      result = result.replace(`auth=${auth}`, `auth=${replacements[auth]}`);
+    return result;
+  }
   const randomDomain = generateRandomStr(12) + ".com";
   replacements[randomDomain] = server;
-  return link.replace(server, randomDomain);
+  let result = link.split(server).join(randomDomain);
+  if (auth) {
+    const randomAuth = generateRandomStr(12);
+    replacements[randomAuth] = auth;
+    result = result.replace(`auth=${auth}`, `auth=${randomAuth}`);
+  }
+  return result;
 }
 function replaceYAML(yamlObj, replacements, suffix = '') {
   if (!yamlObj.proxies) {
