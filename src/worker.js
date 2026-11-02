@@ -17,12 +17,18 @@ const REGION_PATTERNS = [
 
 const src_default = {
   async fetch(request, env, ctx) {
+    let effective = request;
     try {
-      return await handleRequest(request, env, ctx);
+      // 短链接 /s/<token>[/<profile>]: 展开为完整的 /sub?... 请求
+      const resolved = resolveShortLink(request, env);
+      if (resolved instanceof Response)
+        return resolved;
+      effective = resolved || request;
+      return await handleRequest(effective, env, ctx);
     } catch (error) {
       // Any unexpected failure: serve the last good result for this query if there is one
       console.error(`[subconvertion] unhandled error: ${error?.stack || error}`);
-      const url = new URL(request.url);
+      const url = new URL(effective.url);
       const cached = url.searchParams.get("url") ? await getCache(env.SUB_BUCKET, await buildCacheKey(url)).catch(() => null) : null;
       if (cached)
         return cached;
@@ -30,6 +36,47 @@ const src_default = {
     }
   }
 };
+const SHORT_LINK_PREFIX = 's';
+// Expand /s/<token>[/<profile>] using the ACCESS_TOKEN and PROFILES secrets.
+// PROFILES: {"<name>": {"subs": ["https://..."], "params": {"target": "clash", "config": "https://..."}}}
+// Query parameters on the short link override the profile (including url and config).
+// Returns null for other paths, a Response for rejected requests, or the expanded Request.
+function resolveShortLink(request, env) {
+  const url = new URL(request.url);
+  const [prefix, token, profileName = 'default', ...rest] = url.pathname.split('/').filter(Boolean);
+  if (prefix !== SHORT_LINK_PREFIX)
+    return null;
+  const tokens = (env.ACCESS_TOKEN || '').split(',').map((t) => t.trim()).filter(Boolean);
+  // Unknown token and unknown profile look the same, so neither can be probed
+  if (!token || rest.length || !tokens.some((t) => timingSafeEqual(t, token)))
+    return new Response('Not Found', { status: 404 });
+  let profiles;
+  try {
+    profiles = JSON.parse(env.PROFILES || '{}');
+  } catch {
+    return new Response('Invalid PROFILES configuration', { status: 500 });
+  }
+  const profile = Object.hasOwn(profiles, profileName) ? profiles[profileName] : null;
+  if (!profile)
+    return new Response('Not Found', { status: 404 });
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(profile.params || {}))
+    params.set(key, String(value));
+  const subs = Array.isArray(profile.subs) ? profile.subs.join('|') : profile.subs;
+  if (subs)
+    params.set('url', subs);
+  for (const [key, value] of url.searchParams)
+    params.set(key, value);
+  return new Request(`${url.origin}/sub?${params}`, request);
+}
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length)
+    return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++)
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
 async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
     const host = url.origin;
@@ -123,8 +170,11 @@ async function handleRequest(request, env, ctx) {
       if (urlParts.length === 0)
         return new Response("There are no valid links", { status: 400 });
       const fetchHeaders = new Headers(request.headers);
-      // Keep the client's UA (e.g. clash.meta from OpenClash) so the provider returns full mihomo configs
-      if (!CLASH_UA_PATTERN.test(request.headers.get('User-Agent') || ''))
+      // UA used to fetch providers: ?ua= > client's clash-like UA (e.g. clash.meta from OpenClash) > default
+      const uaParam = url.searchParams.get('ua');
+      if (uaParam)
+        fetchHeaders.set('User-Agent', uaParam);
+      else if (!CLASH_UA_PATTERN.test(request.headers.get('User-Agent') || ''))
         fetchHeaders.set('User-Agent', DEFAULT_UA);
       // 并行抓取所有订阅; 单个订阅失败或内容异常时回落到该订阅上次成功的内容
       const loaded = await Promise.all(urlParts.map((url2) => isHttpUrl(url2)
@@ -234,6 +284,8 @@ async function handleRequest(request, env, ctx) {
     url.searchParams.set("url", newUrl);
     // 证书校验跟随机场原始配置(含分享链接里的 allowInsecure), 不让 scv 参数统一改写
     url.searchParams.delete("scv");
+    // ua 只用于抓取机场订阅, 不传给后端
+    url.searchParams.delete("ua");
     let rpResponse;
     try {
       rpResponse = await fetchFromBackends(backends, url.pathname + url.search, request);
