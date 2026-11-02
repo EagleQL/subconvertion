@@ -97,7 +97,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
     const pathSegments = url.pathname.split("/").filter((segment) => segment.length > 0);
     // 规则集转换透传给后端(依次重试); 配置里的 rule-providers 地址会被改写到这里
     if (pathSegments[0] === "getruleset")
-      return fetchFromBackends(backends, url.pathname + url.search, request);
+      return relayRuleset(url, backends, SUB_BUCKET, ctx);
     if (pathSegments.length === 0) {
       const response = await fetch(frontendUrl);
       if (response.status !== 200) {
@@ -223,7 +223,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
         if (sub.ua && sub.ua !== primaryUa)
           uaFallbackSubs++;
         const suffix = new URL(urlParts[0]).searchParams.get('suffix') || url.searchParams.get('suffix') || '';
-        const info = await buildSubInfo(urlParts[0], sub);
+        const info = await buildSubInfo(urlParts[0], sub, suffix);
         const proxies = cloneWithSuffix(sub.parsedObj.data, suffix).proxies
           .filter((p) => p && !INFO_NODE_PATTERN.test(p.name || ''));
         if (/^(1|true)$/i.test(url.searchParams.get('udp') || ''))
@@ -242,7 +242,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
         if (isHttpUrl(url2)) {
 					suffix = new URL(url2).searchParams?.get('suffix') || suffix;
           const sub = loaded[index];
-          subInfos.push(await buildSubInfo(url2, sub));
+          subInfos.push(await buildSubInfo(url2, sub, suffix));
           if (sub.source === 'none') {
             failedSubs++;
             continue;
@@ -900,6 +900,42 @@ function rewriteRuleProviderUrls(config, origin) {
   }
   return count;
 }
+const RULESET_EDGE_TTL = 600;
+// Relay /getruleset to the backends. Clients load dozens of rulesets at once, and under that burst some
+// backends answer 200 with an error body, so only accept real rulesets; good ones are cached at the
+// edge (short TTL) and kept in R2 as a last-good copy for when every backend fails.
+async function relayRuleset(url, backends, bucket, ctx) {
+  const edgeKey = new Request(`${url.origin}${url.pathname}${url.search}`);
+  const hit = await caches.default.match(edgeKey);
+  if (hit)
+    return hit;
+  // subconverter types 3/4/6 are Clash rule-provider formats, which must carry a payload list
+  const needsPayload = ['3', '4', '6'].includes(url.searchParams.get('type') || '');
+  const r2Key = `ruleset/${await sha256Hex(url.search)}`;
+  for (const backend of [...new Set(backends)]) {
+    try {
+      const response = await fetch(`${backend}${url.pathname}${url.search}`, { signal: AbortSignal.timeout(15000) });
+      if (response.status !== 200)
+        continue;
+      const body = await response.text();
+      if (!body.trim() || (needsPayload && !/^\s*payload\s*:/m.test(body))) {
+        console.warn(`[subconvertion] backend ${backend} returned an invalid ruleset, trying next`);
+        continue;
+      }
+      const good = new Response(body, { headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': `public, max-age=${RULESET_EDGE_TTL}` } });
+      ctx.waitUntil(caches.default.put(edgeKey, good.clone()).catch(() => {}));
+      if (typeof bucket?.head === 'function')
+        ctx.waitUntil(bucket.put(r2Key, body).catch(() => {}));
+      return good;
+    } catch (error) {
+      console.warn(`[subconvertion] backend ${backend} ruleset failed: ${error}`);
+    }
+  }
+  const last = typeof bucket?.head === 'function' ? await bucket.get(r2Key).catch(() => null) : null;
+  if (last)
+    return new Response(last.body, { headers: { 'Content-Type': 'text/plain;charset=utf-8', 'X-Subconvertion-Cache': 'ruleset-last-good' } });
+  return new Response('All backends failed to provide the ruleset', { status: 502 });
+}
 const PROVIDER_NAME = 'subconvertion';
 const PLACEHOLDER_GROUP = '🚥‼️ 临替节点';
 const DEFAULT_PROVIDER_INTERVAL = 3600;
@@ -1078,9 +1114,11 @@ function aggregateUserinfo(infos) {
   const expires = valid.map((info) => info.expire).filter((e) => e > 0);
   return `upload=${sum('upload')}; download=${sum('download')}; total=${sum('total')}; expire=${expires.length ? Math.min(...expires) : 0}`;
 }
-async function buildSubInfo(subUrl, sub) {
+// suffix: the subscription's node-name suffix (e.g. -SsRro-HQ), appended to its info node so the
+// info node joins the same template groups as that subscription's nodes (e.g. ⭐️ HQ 优质节点)
+async function buildSubInfo(subUrl, sub, suffix = '') {
   const raw = sub.source === 'none' ? null : sub.headers?.get('subscription-userinfo') || null;
-  return { id: await subId(subUrl), label: subLabel(subUrl), raw, info: parseUserinfo(raw), source: sub.source, stale: !!sub.stale };
+  return { id: await subId(subUrl), label: subLabel(subUrl), raw, info: parseUserinfo(raw), source: sub.source, stale: !!sub.stale, suffix };
 }
 function formatBytes(bytes) {
   if (bytes >= 1024 ** 4)
@@ -1091,6 +1129,9 @@ function formatBytes(bytes) {
 }
 // Name of the info node shown for one subscription; contains "剩余" so template info groups match it
 function infoNodeName(sub) {
+  return infoNodeText(sub) + (sub.suffix || '');
+}
+function infoNodeText(sub) {
   const head = `📊 ${sub.label}`;
   if (sub.source === 'none')
     return `${head} | 获取失败 剩余 未知`;
