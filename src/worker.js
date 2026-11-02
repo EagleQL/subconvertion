@@ -888,7 +888,10 @@ async function loadGroupTemplate(configUrl) {
   if (!configUrl || !isHttpUrl(configUrl))
     return null;
   try {
-    const response = await fetch(configUrl, { signal: AbortSignal.timeout(10000), cf: { cacheTtl: 3600, cacheEverything: true } });
+    // Always read the latest template: a throwaway query param bypasses Cloudflare and GitHub CDN caches
+    const freshUrl = new URL(configUrl);
+    freshUrl.searchParams.set('_t', String(Date.now()));
+    const response = await fetch(freshUrl, { signal: AbortSignal.timeout(10000) });
     return response.ok ? parseGroupTemplate(await response.text()) : null;
   } catch (error) {
     console.warn(`[subconvertion] template fetch failed: ${error}`);
