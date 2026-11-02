@@ -270,9 +270,10 @@ async function handleRequest(request, env, ctx) {
 				try {
 					const config = jsYaml.load(result);
 					// 后端不支持的协议(如 anytls / vless reality)会被丢弃, 用原始节点补齐
-					const filledCount = config && typeof config === 'object' ? fillMissingProxies(config, originalConfigs) : 0;
-					if (filledCount)
-						console.warn(`[subconvertion] restored ${filledCount} node(s) dropped by backend`);
+					const { restored: filledCount, backfilled } = config && typeof config === 'object'
+						? fillMissingProxies(config, originalConfigs) : { restored: 0, backfilled: 0 };
+					if (filledCount || backfilled)
+						console.warn(`[subconvertion] restored ${filledCount} node(s), backfilled fields on ${backfilled} node(s)`);
 					if (config.proxies?.length) {
 						const callbackNode = { ...config.proxies[0], name: '🚥‼️ 临替节点' };
 						config.proxies.push(callbackNode);
@@ -296,6 +297,8 @@ async function handleRequest(request, env, ctx) {
 					const headers = new Headers(rpResponse.headers);
 					if (filledCount)
 						headers.set('X-Subconvertion-Restored', String(filledCount));
+					if (backfilled)
+						headers.set('X-Subconvertion-Backfilled', String(backfilled));
 					if (config.proxies?.length)
 						return respond(resultNew, { status: rpResponse.status, statusText: rpResponse.statusText, headers });
 					return new Response(resultNew, { status: rpResponse.status, statusText: rpResponse.statusText, headers });
@@ -597,41 +600,108 @@ function cloneWithSuffix(yamlObj, suffix = '') {
     copy.proxies.forEach((proxy) => { proxy.name = proxy.name ? `${proxy.name}${suffix}` : suffix; });
   return copy;
 }
-// Identify a node by its connection endpoint and credential, independent of renaming by the backend
+// Endpoint + credential; several CDN-fronted nodes may share it, so DETAIL_FIELDS disambiguate
 function proxyKey(proxy) {
   return `${proxy.server}|${proxy.port}|${proxy.uuid || proxy.password || ''}`;
+}
+const DETAIL_FIELDS = [
+  (p) => p.type,
+  (p) => p.servername || p.sni,
+  (p) => p.network,
+  (p) => p['ws-opts']?.path,
+  (p) => p['ws-opts']?.headers?.Host,
+  (p) => p['grpc-opts']?.['grpc-service-name'],
+];
+// strict: every detail equal; lenient: a detail omitted on either side is accepted (backends drop defaults)
+function detailsMatch(a, b, strict) {
+  return DETAIL_FIELDS.every((field) => {
+    const x = field(a), y = field(b);
+    return x == null || y == null ? (!strict || x == y) : String(x) === String(y);
+  });
+}
+// One-to-one match of original nodes to converted nodes (independent of renaming by the backend).
+// Returns a Map original -> converted; unmatched originals were dropped by the backend.
+function matchProxies(converted, originals) {
+  const byKey = new Map();
+  for (const proxy of converted) {
+    const key = proxyKey(proxy);
+    byKey.set(key, [...(byKey.get(key) || []), proxy]);
+  }
+  const used = new Set();
+  const matches = new Map();
+  for (const strict of [true, false]) {
+    for (const original of originals) {
+      if (matches.has(original))
+        continue;
+      const candidate = (byKey.get(proxyKey(original)) || []).find((p) => !used.has(p) && detailsMatch(original, p, strict));
+      if (candidate) {
+        used.add(candidate);
+        matches.set(original, candidate);
+      }
+    }
+  }
+  return matches;
+}
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+// Copy keys present in source but missing in target (recursively), e.g. ech-opts dropped by the backend.
+// Existing values are never overwritten, so backend options such as scv/udp still apply.
+function backfillMissingFields(target, source) {
+  let count = 0;
+  for (const [key, value] of Object.entries(source)) {
+    if (key === 'name')
+      continue;
+    if (!(key in target)) {
+      target[key] = structuredClone(value);
+      count++;
+    } else if (isPlainObject(value) && isPlainObject(target[key])) {
+      count += backfillMissingFields(target[key], value);
+    }
+  }
+  return count;
 }
 function regionOf(name) {
   return REGION_PATTERNS.find((pattern) => pattern.test(name || ''));
 }
-// Append original nodes missing from config.proxies, and add them to matching proxy-groups.
-// Returns the number of restored nodes.
+// Reconcile converted nodes with the originals: backfill fields the backend dropped on kept nodes,
+// append nodes the backend dropped entirely and add them to matching proxy-groups.
+// Returns { restored, backfilled } (backfilled = number of nodes that received fields).
 function fillMissingProxies(config, originalConfigs) {
   const originals = originalConfigs.flatMap((c) => (Array.isArray(c?.proxies) ? c.proxies : []));
-  if (!originals.length)
-    return 0;
   if (!Array.isArray(config.proxies))
     config.proxies = [];
+  if (!originals.length)
+    return { restored: 0, backfilled: 0 };
+  const matches = matchProxies(config.proxies, originals);
+  let backfilled = 0;
+  for (const [original, converted] of matches)
+    if (backfillMissingFields(converted, original))
+      backfilled++;
   const existingNames = new Set(config.proxies.map((p) => p.name));
   const realNames = new Set(existingNames);
-  const seenKeys = new Set(config.proxies.map(proxyKey));
+  const seen = new Set();
   const missing = [];
   for (const proxy of originals) {
-    const key = proxyKey(proxy);
-    if (seenKeys.has(key))
+    if (matches.has(proxy))
       continue;
-    seenKeys.add(key);
+    // Skip exact duplicates (e.g. the same node listed by two subscriptions)
+    const { name: _, ...rest } = proxy;
+    const signature = JSON.stringify(rest);
+    if (seen.has(signature))
+      continue;
+    seen.add(signature);
     let name = proxy.name || 'node';
     for (let i = 2; existingNames.has(name); i++)
       name = `${proxy.name} ${i}`;
     existingNames.add(name);
     missing.push({ ...proxy, name });
   }
-  if (!missing.length)
-    return 0;
-  config.proxies.push(...missing);
-  addToProxyGroups(config, missing, realNames);
-  return missing.length;
+  if (missing.length) {
+    config.proxies.push(...missing);
+    addToProxyGroups(config, missing, realNames);
+  }
+  return { restored: missing.length, backfilled };
 }
 function addToProxyGroups(config, missing, realNames) {
   const groups = Array.isArray(config['proxy-groups']) ? config['proxy-groups'] : [];
