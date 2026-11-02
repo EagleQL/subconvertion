@@ -65,6 +65,10 @@ function resolveShortLink(request, env) {
   const subs = Array.isArray(profile.subs) ? profile.subs.join('|') : profile.subs;
   if (subs)
     params.set('url', subs);
+  // UA priority: profile ua < client's clash-like User-Agent header < ?ua= on the short link
+  const headerUa = request.headers.get('User-Agent') || '';
+  if (CLASH_UA_PATTERN.test(headerUa))
+    params.set('ua', headerUa);
   for (const [key, value] of url.searchParams)
     params.set(key, value);
   return new Request(`${url.origin}/sub?${params}`, request);
@@ -139,11 +143,13 @@ async function handleRequest(request, env, ctx) {
     const cacheKey = await buildCacheKey(url);
     // failedSubs: neither fresh content nor a per-subscription cache was available
     // subCacheHits: served from the per-subscription cache; degradedSubs: fresh but suspiciously shrunk
-    let failedSubs = 0, subCacheHits = 0, degradedSubs = 0;
+    let failedSubs = 0, subCacheHits = 0, degradedSubs = 0, uaFallbackSubs = 0;
     const respond = (body, init) => {
       const headers = new Headers(init.headers);
       if (subCacheHits)
         headers.set('X-Subconvertion-Sub-Cache', String(subCacheHits));
+      if (uaFallbackSubs)
+        headers.set('X-Subconvertion-UA-Fallback', String(uaFallbackSubs));
       if (degradedSubs)
         headers.set('X-Subconvertion-Degraded', String(degradedSubs));
       // Only a complete, healthy result may replace the last good result
@@ -176,9 +182,12 @@ async function handleRequest(request, env, ctx) {
         fetchHeaders.set('User-Agent', uaParam);
       else if (!CLASH_UA_PATTERN.test(request.headers.get('User-Agent') || ''))
         fetchHeaders.set('User-Agent', DEFAULT_UA);
+      // 首选 UA 失败(非 2xx 或无可用节点)时依次尝试的备选 UA
+      const primaryUa = fetchHeaders.get('User-Agent');
+      const uaCandidates = [...new Set([primaryUa, ...uaFallbacks(env)])];
       // 并行抓取所有订阅; 单个订阅失败或内容异常时回落到该订阅上次成功的内容
       const loaded = await Promise.all(urlParts.map((url2) => isHttpUrl(url2)
-        ? loadSubscription(url2, { method: request.method, headers: fetchHeaders }, SUB_BUCKET, ctx)
+        ? loadSubscription(url2, { method: request.method, headers: fetchHeaders }, SUB_BUCKET, ctx, uaCandidates)
         : null));
 
       for (const [index, url2] of urlParts.entries()) {
@@ -197,6 +206,8 @@ async function handleRequest(request, env, ctx) {
             subCacheHits++;
           if (sub.suspicious)
             degradedSubs++;
+          if (sub.ua && sub.ua !== primaryUa)
+            uaFallbackSubs++;
           parsedObj = sub.parsedObj;
           firstSubHeaders ??= sub.headers;
           await SUB_BUCKET.put(key + "_headers", JSON.stringify(Object.fromEntries(sub.headers)));
@@ -809,7 +820,8 @@ function isHttpUrl(link) {
 }
 // Provider "nodes" that only carry notices (traffic left, expiry, website...) are not usable proxies.
 // Plain "流量" is deliberately excluded: real node names often contain e.g. "流量倍率:1"
-const INFO_NODE_PATTERN = /剩余|到期|过期|套餐|官网|网址|重置|续费|公告|客服|群组|expire|remaining/i;
+// Also covers placeholder nodes providers return for rejected clients (e.g. "访问受限", "请更新客户端")
+const INFO_NODE_PATTERN = /剩余|到期|过期|套餐|官网|网址|重置|续费|公告|客服|群组|访问受限|请更新|请使用|不支持|expire|remaining/i;
 function nodeNameOfLink(link) {
   const hash = link.indexOf('#');
   if (hash >= 0) {
@@ -834,38 +846,65 @@ function countRealNodes(parsedObj) {
 const SUB_CACHE_PREFIX = 'subcache/';
 const SUB_CACHE_MAX_AGE_MS = 30 * 24 * 3600 * 1000;
 const SUB_CACHE_REFRESH_MS = 7 * 24 * 3600 * 1000;
-// Fetch one subscription; on failure, empty/notice-only content, fall back to its last good content.
-// Returns { source: 'fresh' | 'cache' | 'none', parsedObj, headers, suspicious }
-async function loadSubscription(subUrl, init, bucket, ctx) {
+// Fallback UAs tried in order when the preferred UA is rejected (env UA_FALLBACKS overrides, comma-separated)
+const DEFAULT_UA_FALLBACKS = [
+  'clash-verge/v2.4.2',
+  'clash.meta',
+  'mihomo/1.19.15',
+  'ClashX Pro/1.118.1.1 (com.west2online.ClashXPro; build:1.118.1.1; macOS 15.4.1) Alamofire/5.8.0',
+];
+function uaFallbacks(env) {
+  const configured = (env.UA_FALLBACKS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  return configured.length ? configured : DEFAULT_UA_FALLBACKS;
+}
+// Fetch one subscription trying each UA in order until one yields usable nodes; if none does
+// (errors, empty or notice-only content), fall back to the subscription's last good content.
+// Returns { source: 'fresh' | 'cache' | 'none', parsedObj, headers, suspicious, ua }
+async function loadSubscription(subUrl, init, bucket, ctx, uaCandidates = [new Headers(init.headers).get('User-Agent')]) {
   const host = new URL(subUrl).host;
   const cacheKey = SUB_CACHE_PREFIX + await sha256Hex(subUrl);
+  // All attempts share one deadline so a provider that keeps rejecting cannot stall the request
+  const deadline = Date.now() + SUB_FETCH_TIMEOUT_MS * 1.5;
   let fresh;
-  try {
-    // Bound the whole download (headers + body) so a hung provider cannot stall the request
-    const response = await fetch(subUrl, { ...init, redirect: 'follow', signal: AbortSignal.timeout(SUB_FETCH_TIMEOUT_MS) });
-    if (response.ok) {
+  for (const ua of uaCandidates) {
+    const remaining = Math.min(SUB_FETCH_TIMEOUT_MS, deadline - Date.now());
+    if (remaining <= 0)
+      break;
+    const headers = new Headers(init.headers);
+    if (ua)
+      headers.set('User-Agent', ua);
+    try {
+      // Bound the whole download (headers + body) so a hung provider cannot stall the request
+      const response = await fetch(subUrl, { ...init, headers, redirect: 'follow', signal: AbortSignal.timeout(remaining) });
+      if (!response.ok) {
+        console.warn(`[subconvertion] Fetch failed: ${host}, UA ${ua}, status: ${response.status}`);
+        continue;
+      }
       const text = await response.text();
-      fresh = { text, headers: response.headers, parsedObj: parseData(text) };
-    } else {
-      console.warn(`[subconvertion] Fetch failed: ${host}, status: ${response.status}`);
+      const parsedObj = parseData(text);
+      const nodeCount = countRealNodes(parsedObj);
+      if (nodeCount > 0) {
+        fresh = { text, headers: response.headers, parsedObj, nodeCount, ua };
+        break;
+      }
+      console.warn(`[subconvertion] No usable nodes from ${host} with UA ${ua}`);
+    } catch (error) {
+      // Network errors and timeouts do not depend on the UA, so trying others would only add delay
+      console.warn(`[subconvertion] Fetch error: ${host}, ${error}`);
+      break;
     }
-  } catch (error) {
-    console.warn(`[subconvertion] Fetch error: ${host}, ${error}`);
   }
   const cached = await readSubCache(bucket, cacheKey).catch(() => null);
   if (fresh) {
-    const nodeCount = countRealNodes(fresh.parsedObj);
-    if (nodeCount > 0) {
-      // A sharp drop (e.g. plan expired, provider glitch) must not overwrite the last good copy,
-      // unless that copy is old enough that the drop is likely permanent
-      const suspicious = !!cached && cached.nodeCount >= 5 && nodeCount < cached.nodeCount * 0.3;
-      if (suspicious)
-        console.warn(`[subconvertion] ${host}: node count dropped ${cached.nodeCount} -> ${nodeCount}`);
-      if (!suspicious || Date.now() - cached.cachedAt > SUB_CACHE_REFRESH_MS)
-        ctx.waitUntil(writeSubCache(bucket, cacheKey, fresh.text, fresh.headers, nodeCount).catch((e) => console.warn(`[subconvertion] sub cache write failed: ${e}`)));
-      return { source: 'fresh', parsedObj: fresh.parsedObj, headers: fresh.headers, suspicious };
-    }
-    console.warn(`[subconvertion] No usable nodes from ${host}`);
+    const { nodeCount } = fresh;
+    // A sharp drop (e.g. plan expired, provider glitch) must not overwrite the last good copy,
+    // unless that copy is old enough that the drop is likely permanent
+    const suspicious = !!cached && cached.nodeCount >= 5 && nodeCount < cached.nodeCount * 0.3;
+    if (suspicious)
+      console.warn(`[subconvertion] ${host}: node count dropped ${cached.nodeCount} -> ${nodeCount}`);
+    if (!suspicious || Date.now() - cached.cachedAt > SUB_CACHE_REFRESH_MS)
+      ctx.waitUntil(writeSubCache(bucket, cacheKey, fresh.text, fresh.headers, nodeCount).catch((e) => console.warn(`[subconvertion] sub cache write failed: ${e}`)));
+    return { source: 'fresh', parsedObj: fresh.parsedObj, headers: fresh.headers, suspicious, ua: fresh.ua };
   }
   if (cached && Date.now() - cached.cachedAt <= SUB_CACHE_MAX_AGE_MS) {
     console.warn(`[subconvertion] ${host}: using cached subscription (age ${Math.round((Date.now() - cached.cachedAt) / 1000)}s)`);
