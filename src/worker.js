@@ -232,6 +232,8 @@ async function handleRequest(request, env, ctx) {
 		// 请求 subConverter 模版转换端点API，获取转换后的数据
     const newUrl = replacedURIs.join("|");
     url.searchParams.set("url", newUrl);
+    // 证书校验跟随机场原始配置(含分享链接里的 allowInsecure), 不让 scv 参数统一改写
+    url.searchParams.delete("scv");
     let rpResponse;
     try {
       rpResponse = await fetchFromBackends(backends, url.pathname + url.search, request);
@@ -642,6 +644,8 @@ function matchProxies(converted, originals) {
   }
   return matches;
 }
+// Node fields that must follow the provider's original config rather than conversion options
+const PROVIDER_FIELDS = ['skip-cert-verify'];
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -669,15 +673,23 @@ function regionOf(name) {
 // Returns { restored, backfilled } (backfilled = number of nodes that received fields).
 function fillMissingProxies(config, originalConfigs) {
   const originals = originalConfigs.flatMap((c) => (Array.isArray(c?.proxies) ? c.proxies : []));
-  if (!Array.isArray(config.proxies))
-    config.proxies = [];
   if (!originals.length)
     return { restored: 0, backfilled: 0 };
+  if (!Array.isArray(config.proxies))
+    config.proxies = [];
   const matches = matchProxies(config.proxies, originals);
   let backfilled = 0;
-  for (const [original, converted] of matches)
+  for (const [original, converted] of matches) {
     if (backfillMissingFields(converted, original))
       backfilled++;
+    // Fields the provider decides: take them verbatim from the original node (absent stays absent)
+    for (const key of PROVIDER_FIELDS) {
+      if (key in original)
+        converted[key] = structuredClone(original[key]);
+      else
+        delete converted[key];
+    }
+  }
   const existingNames = new Set(config.proxies.map((p) => p.name));
   const realNames = new Set(existingNames);
   const seen = new Set();
