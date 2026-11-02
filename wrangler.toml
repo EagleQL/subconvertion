@@ -5,6 +5,9 @@ workers_dev = true
 compatibility_flags = ["nodejs_compat_v2"]
 # workers.dev is often blocked in mainland China; the custom domain is reachable directly
 routes = [{ pattern = "subconvertion.tangri.top", custom_domain = true }]
+# PROFILES is a plain-text variable edited in the dashboard (it contains subscription tokens,
+# so it must never be committed here); keep dashboard variables across deploys
+keep_vars = true
 
 [vars]
 # 逗号分隔, 按顺序尝试, 前一个失败(非 200 / 超时 / 网络错误)则换下一个
