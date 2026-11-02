@@ -955,18 +955,49 @@ function rewriteRuleProviderUrls(config, origin) {
   }
   return count;
 }
-const RULESET_EDGE_TTL = 600;
-// Relay /getruleset to the backends. Clients load dozens of rulesets at once, and under that burst some
-// backends answer 200 with an error body, so only accept real rulesets; good ones are cached at the
-// edge (short TTL) and kept in R2 as a last-good copy for when every backend fails.
+// Convert a classical .list file to a Clash rule-provider payload; returns null if no rules are found
+function listToClassicalPayload(text) {
+  if (/^\s*payload\s*:/m.test(text))
+    return text;
+  const rules = text.split(/\r?\n/)
+    .map((l) => l.trim().replace(/^-\s+/, ''))
+    .filter((l) => l && !/^(#|;|\/\/)/.test(l) && /^[A-Z0-9-]+,/i.test(l));
+  return rules.length ? `payload:\n${rules.map((r) => `  - ${r}`).join('\n')}\n` : null;
+}
+// Serve /getruleset without edge caching so manual "Update" in the dashboard always pulls the latest rules.
+// For classical Clash rulesets (type=6), fetch the source .list directly with a cache-busting query param
+// (no third-party backend cache, much faster); fall back to the backends, then to the R2 last-good copy.
 async function relayRuleset(url, backends, bucket, ctx) {
-  const edgeKey = new Request(`${url.origin}${url.pathname}${url.search}`);
-  const hit = await caches.default.match(edgeKey);
-  if (hit)
-    return hit;
-  // subconverter types 3/4/6 are Clash rule-provider formats, which must carry a payload list
-  const needsPayload = ['3', '4', '6'].includes(url.searchParams.get('type') || '');
+  const type = url.searchParams.get('type') || '';
+  const encoded = url.searchParams.get('url') || '';
   const r2Key = `ruleset/${await sha256Hex(url.search)}`;
+  const saveAndRespond = (body, source) => {
+    if (typeof bucket?.head === 'function')
+      ctx.waitUntil(bucket.put(r2Key, body).catch(() => {}));
+    return new Response(body, {
+      headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-store', 'X-Subconvertion-Ruleset': source },
+    });
+  };
+  let sourceUrl = '';
+  try {
+    sourceUrl = urlSafeBase64Decode(encoded).trim();
+  } catch {}
+  if (type === '6' && isHttpUrl(sourceUrl) && !sourceUrl.includes('|')) {
+    try {
+      const freshUrl = new URL(sourceUrl);
+      freshUrl.searchParams.set('_t', String(Date.now()));
+      const response = await fetch(freshUrl, { signal: AbortSignal.timeout(10000), headers: { 'Cache-Control': 'no-cache' } });
+      if (response.ok) {
+        const body = listToClassicalPayload(await response.text());
+        if (body)
+          return saveAndRespond(body, 'direct');
+      }
+    } catch (error) {
+      console.warn(`[subconvertion] direct ruleset fetch failed (${sourceUrl}): ${error}`);
+    }
+  }
+  // subconverter types 3/4/6 are Clash rule-provider formats, which must carry a payload list
+  const needsPayload = ['3', '4', '6'].includes(type);
   for (const backend of [...new Set(backends)]) {
     try {
       const response = await fetch(`${backend}${url.pathname}${url.search}`, { signal: AbortSignal.timeout(15000) });
@@ -977,18 +1008,14 @@ async function relayRuleset(url, backends, bucket, ctx) {
         console.warn(`[subconvertion] backend ${backend} returned an invalid ruleset, trying next`);
         continue;
       }
-      const good = new Response(body, { headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': `public, max-age=${RULESET_EDGE_TTL}` } });
-      ctx.waitUntil(caches.default.put(edgeKey, good.clone()).catch(() => {}));
-      if (typeof bucket?.head === 'function')
-        ctx.waitUntil(bucket.put(r2Key, body).catch(() => {}));
-      return good;
+      return saveAndRespond(body, backend);
     } catch (error) {
       console.warn(`[subconvertion] backend ${backend} ruleset failed: ${error}`);
     }
   }
   const last = typeof bucket?.head === 'function' ? await bucket.get(r2Key).catch(() => null) : null;
   if (last)
-    return new Response(last.body, { headers: { 'Content-Type': 'text/plain;charset=utf-8', 'X-Subconvertion-Cache': 'ruleset-last-good' } });
+    return new Response(last.body, { headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-store', 'X-Subconvertion-Cache': 'ruleset-last-good' } });
   return new Response('All backends failed to provide the ruleset', { status: 502 });
 }
 const PROVIDER_NAME = 'subconvertion';
