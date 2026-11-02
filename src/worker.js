@@ -2,6 +2,8 @@ import jsYaml from 'js-yaml';
 
 const DEFAULT_UA = 'clash.meta';
 const SUB_FETCH_TIMEOUT_MS = 20000;
+// Single-subscription node lists answer within this budget (OpenClash reads subscription info with a 5s timeout)
+const LIST_SOFT_DEADLINE_MS = 3500;
 const CLASH_UA_PATTERN = /clash|mihomo|meta|stash/i;
 // Region detection for proxy-group membership; codes are matched only when not surrounded by letters
 const REGION_PATTERNS = [
@@ -148,8 +150,13 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
     // failedSubs: neither fresh content nor a per-subscription cache was available
     // subCacheHits: served from the per-subscription cache; degradedSubs: fresh but suspiciously shrunk
     let failedSubs = 0, subCacheHits = 0, degradedSubs = 0, uaFallbackSubs = 0;
+    // Per-subscription traffic/expiry, used for the aggregated header and the info nodes
+    const subInfos = [];
+    let userinfoOverride = null;
     const respond = (body, init) => {
       const headers = new Headers(init.headers);
+      if (userinfoOverride)
+        headers.set('subscription-userinfo', userinfoOverride);
       if (subCacheHits)
         headers.set('X-Subconvertion-Sub-Cache', String(subCacheHits));
       if (uaFallbackSubs)
@@ -176,9 +183,18 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
       }
     } else {
 			// 将订阅链接中的原始节点数据脱敏后暂存到 KV 中
-      const urlParts = urlParam.split("|").filter((part) => part.trim() !== "");
+      let urlParts = urlParam.split("|").filter((part) => part.trim() !== "");
       if (urlParts.length === 0)
         return new Response("There are no valid links", { status: 400 });
+      // sub=<id>: only one subscription (per-subscription proxy-provider); id = hash prefix of its URL
+      const subFilter = url.searchParams.get('sub');
+      if (subFilter) {
+        const ids = await Promise.all(urlParts.map(subId));
+        urlParts = urlParts.filter((_, i) => ids[i] === subFilter);
+        if (!urlParts.length)
+          return new Response("Unknown subscription", { status: 404 });
+      }
+      const listMode = /^(1|true)$/i.test(url.searchParams.get('list') || '');
       const fetchHeaders = new Headers(request.headers);
       // UA used to fetch providers: ?ua= > client's clash-like UA (e.g. clash.meta from OpenClash) > default
       const uaParam = url.searchParams.get('ua');
@@ -190,9 +206,33 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
       const primaryUa = fetchHeaders.get('User-Agent');
       const uaCandidates = [...new Set([primaryUa, ...uaFallbacks(env)])];
       // 并行抓取所有订阅; 单个订阅失败或内容异常时回落到该订阅上次成功的内容
+      // 单订阅节点列表供 provider/面板拉取, 客户端超时短(OpenClash 取订阅信息仅 5 秒): 超过软时限就先回缓存, 后台继续刷新
+      const softDeadline = listMode && subFilter ? LIST_SOFT_DEADLINE_MS : 0;
       const loaded = await Promise.all(urlParts.map((url2) => isHttpUrl(url2)
-        ? loadSubscription(url2, { method: request.method, headers: fetchHeaders }, SUB_BUCKET, ctx, uaCandidates)
+        ? loadSubscription(url2, { method: request.method, headers: fetchHeaders }, SUB_BUCKET, ctx, uaCandidates, softDeadline)
         : null));
+
+      // 单订阅节点列表且机场返回 mihomo YAML: 直接透传(不经后端), 快且不丢字段
+      if (listMode && subFilter && urlParts.length === 1 && isHttpUrl(urlParts[0])
+        && loaded[0].source !== 'none' && loaded[0].parsedObj.format === 'yaml') {
+        const sub = loaded[0];
+        if (sub.source === 'cache')
+          subCacheHits++;
+        if (sub.suspicious)
+          degradedSubs++;
+        if (sub.ua && sub.ua !== primaryUa)
+          uaFallbackSubs++;
+        const suffix = new URL(urlParts[0]).searchParams.get('suffix') || url.searchParams.get('suffix') || '';
+        const info = await buildSubInfo(urlParts[0], sub);
+        const proxies = cloneWithSuffix(sub.parsedObj.data, suffix).proxies
+          .filter((p) => p && !INFO_NODE_PATTERN.test(p.name || ''));
+        if (/^(1|true)$/i.test(url.searchParams.get('udp') || ''))
+          for (const p of proxies)
+            p.udp ??= true;
+        proxies.push(infoNode(infoNodeName(info)));
+        userinfoOverride = info.raw;
+        return respond(jsYaml.dump({ proxies }), { status: 200, headers: { 'Content-Type': 'text/yaml;charset=UTF-8', 'X-Subconvertion-Native': '1' } });
+      }
 
       for (const [index, url2] of urlParts.entries()) {
         const key = generateRandomStr(11);
@@ -202,6 +242,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
         if (isHttpUrl(url2)) {
 					suffix = new URL(url2).searchParams?.get('suffix') || suffix;
           const sub = loaded[index];
+          subInfos.push(await buildSubInfo(url2, sub));
           if (sub.source === 'none') {
             failedSubs++;
             continue;
@@ -265,6 +306,8 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
       }
     }
 
+    // 多个订阅的流量信息汇总成一个 subscription-userinfo(用量求和, 到期取最早)
+    userinfoOverride = aggregateUserinfo(subInfos.map((s) => s.info));
     // 无论成功与否都清理暂存数据, 避免脱敏数据残留在 R2
     const cleanup = async () => {
       for (const key of keys) {
@@ -279,8 +322,9 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
       const base = originalConfigs.find((c) => c["proxy-groups"]) || originalConfigs[0];
       const config = structuredClone(base);
       fillMissingProxies(config, originalConfigs.filter((c) => c !== base));
+      replaceInfoNodes(config, subInfos);
       const headers = new Headers({ "Content-Type": "text/yaml;charset=UTF-8", "X-Subconvertion-Fallback": "original" });
-      const userInfo = firstSubHeaders?.get("subscription-userinfo");
+      const userInfo = userinfoOverride || firstSubHeaders?.get("subscription-userinfo");
       if (userInfo)
         headers.set("subscription-userinfo", userInfo);
       return new Response(jsYaml.dump(config), { status: 200, headers });
@@ -348,6 +392,9 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
 						? fillMissingProxies(config, originalConfigs) : { restored: 0, backfilled: 0 };
 					if (filledCount || backfilled)
 						console.warn(`[subconvertion] restored ${filledCount} node(s), backfilled fields on ${backfilled} node(s)`);
+					// 机场自带的「剩余流量/到期」提示节点换成每个订阅一个的汇总信息节点
+					if (config && typeof config === 'object')
+						replaceInfoNodes(config, subInfos);
 					const hasNodes = !!config.proxies?.length;
 					// 临替节点只用于填补空策略组; 节点列表(list=true)和 provider 模式下不需要
 					if (hasNodes && config["proxy-groups"] && !providerMode) {
@@ -375,7 +422,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
 						console.warn(`[subconvertion] rewrote ${rewrittenRulesets} rule-provider url(s)`);
 					if (hasNodes && providerMode && config["proxy-groups"]) {
 						const template = await loadGroupTemplate(url.searchParams.get("config"));
-						toProviderConfig(config, template, buildProviderUrl(linkUrl || request.url), providerInterval);
+						toProviderConfig(config, template, linkUrl || request.url, providerInterval, subInfos);
 					}
 					const resultNew = jsYaml.dump(config);
 					const headers = new Headers(rpResponse.headers);
@@ -856,20 +903,29 @@ function rewriteRuleProviderUrls(config, origin) {
 const PROVIDER_NAME = 'subconvertion';
 const DEFAULT_PROVIDER_INTERVAL = 3600;
 const BUILTIN_POLICIES = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE']);
-// Node list endpoint for the provider: same request (short link or long URL) with list=true
-function buildProviderUrl(href) {
+// Node list endpoint for a provider: same request (short link or long URL) with list=true,
+// restricted to one subscription by sub=<id>
+function buildProviderUrl(href, id) {
   const providerUrl = new URL(href);
   providerUrl.searchParams.delete('provider');
   providerUrl.searchParams.delete('provider_interval');
   providerUrl.searchParams.set('list', 'true');
+  if (id)
+    providerUrl.searchParams.set('sub', id);
   return providerUrl.href;
 }
 // Parse subconverter custom_proxy_group lines: name`type`members...[`test-url`interval,timeout,tolerance]
 // Members starting with [] reference groups/policies; other members are node-name regexes.
+// Also returns the template-wide include/exclude remark filters.
 function parseGroupTemplate(ini) {
   const groups = new Map();
+  let excludeRemarks = '', includeRemarks = '';
   for (const raw of ini.split(/\r?\n/)) {
     const line = raw.trim();
+    if (line.startsWith('exclude_remarks='))
+      excludeRemarks = line.slice('exclude_remarks='.length);
+    else if (line.startsWith('include_remarks='))
+      includeRemarks = line.slice('include_remarks='.length);
     if (!line.startsWith('custom_proxy_group='))
       continue;
     const [name, type, ...members] = line.slice('custom_proxy_group='.length).split('`');
@@ -882,7 +938,7 @@ function parseGroupTemplate(ini) {
     }
     groups.set(name, { type, refs, filters });
   }
-  return groups;
+  return { groups, excludeRemarks, includeRemarks };
 }
 async function loadGroupTemplate(configUrl) {
   if (!configUrl || !isHttpUrl(configUrl))
@@ -901,16 +957,29 @@ async function loadGroupTemplate(configUrl) {
 function escapeRegex(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
-// Rewrite a converted config so groups pull nodes from one proxy-provider instead of inline proxies.
+// Rewrite a converted config so groups pull nodes from proxy-providers (one per subscription, so
+// clients show traffic/expiry per subscription) instead of inline proxies.
 // Node regexes come from the template so new nodes join the right groups on provider refresh;
 // groups without a template definition fall back to an exact-name filter of their current nodes.
-function toProviderConfig(config, template, providerUrl, interval) {
+function toProviderConfig(config, template, href, interval, subInfos = []) {
+  const providers = {};
+  const seenNames = new Set();
+  for (const sub of subInfos) {
+    let name = sub.label;
+    if (seenNames.has(name))
+      name = `${name} #${sub.id}`;
+    seenNames.add(name);
+    providers[name] = { url: buildProviderUrl(href, sub.id), path: `./proxy_providers/sub-${sub.id}.yaml` };
+  }
+  if (!Object.keys(providers).length)
+    providers[PROVIDER_NAME] = { url: buildProviderUrl(href), path: `./proxy_providers/${PROVIDER_NAME}.yaml` };
+  const providerNames = Object.keys(providers);
   const nodeNames = new Set(config.proxies.map((p) => p.name));
   const groupNames = new Set(config['proxy-groups'].map((g) => g.name));
   const isPolicy = (n) => groupNames.has(n) || BUILTIN_POLICIES.has(n);
   config['proxy-groups'] = config['proxy-groups'].map((group) => {
     const { proxies = [], ...rest } = group;
-    const definition = template?.get(group.name);
+    const definition = template?.groups.get(group.name);
     const supported = definition && !definition.filters.some((f) => f.startsWith('!!'));
     let refs, filter, useProvider = false;
     if (supported) {
@@ -932,25 +1001,119 @@ function toProviderConfig(config, template, providerUrl, interval) {
     if (refs.length || !useProvider)
       result.proxies = refs.length ? refs : ['DIRECT'];
     if (useProvider) {
-      result.use = [PROVIDER_NAME];
+      // A fresh array per group, so the YAML dump does not emit anchors/aliases
+      result.use = [...providerNames];
       if (filter)
         result.filter = filter;
     }
     return result;
   });
   delete config.proxies;
-  config['proxy-providers'] = {
-    [PROVIDER_NAME]: {
-      type: 'http',
-      url: providerUrl,
-      path: `./proxy_providers/${PROVIDER_NAME}.yaml`,
-      interval,
-      'health-check': { enable: true, url: 'http://cp.cloudflare.com/generate_204', interval: 300, lazy: true },
-    },
-  };
+  config['proxy-providers'] = Object.fromEntries(providerNames.map((name) => [name, {
+    type: 'http',
+    url: providers[name].url,
+    path: providers[name].path,
+    interval,
+    // Template-wide node filters (the backend applied them to inline nodes before)
+    ...(template?.includeRemarks && { filter: template.includeRemarks }),
+    ...(template?.excludeRemarks && { 'exclude-filter': template.excludeRemarks }),
+    'health-check': { enable: true, url: 'http://cp.cloudflare.com/generate_204', interval: 300, lazy: true },
+  }]));
 }
 function isHttpUrl(link) {
   return link.startsWith("https://") || link.startsWith("http://");
+}
+// ---- Per-subscription traffic/expiry info ----
+async function subId(subUrl) {
+  return (await sha256Hex(subUrl)).slice(0, 8);
+}
+// host[:port]/path of a subscription with token-like path segments masked (abcd…wxyz)
+function subLabel(subUrl) {
+  const u = new URL(subUrl);
+  const path = u.pathname.split('/').filter(Boolean)
+    .map((s) => (s.length >= 12 && /^[A-Za-z0-9_-]+$/.test(s) ? `${s.slice(0, 4)}…${s.slice(-4)}` : s))
+    .join('/');
+  return path ? `${u.host}/${path}` : u.host;
+}
+function parseUserinfo(value) {
+  if (!value)
+    return null;
+  const info = {};
+  for (const part of value.split(';')) {
+    const [key, val] = part.split('=').map((s) => s?.trim());
+    if (key && val && /^\d+(\.\d+)?$/.test(val))
+      info[key.toLowerCase()] = Number(val);
+  }
+  return Object.keys(info).length ? info : null;
+}
+// Sum traffic across subscriptions; expiry = the earliest one (0 = long-term / unknown)
+function aggregateUserinfo(infos) {
+  const valid = infos.filter(Boolean);
+  if (!valid.length)
+    return null;
+  const sum = (key) => valid.reduce((total, info) => total + (info[key] || 0), 0);
+  const expires = valid.map((info) => info.expire).filter((e) => e > 0);
+  return `upload=${sum('upload')}; download=${sum('download')}; total=${sum('total')}; expire=${expires.length ? Math.min(...expires) : 0}`;
+}
+async function buildSubInfo(subUrl, sub) {
+  const raw = sub.source === 'none' ? null : sub.headers?.get('subscription-userinfo') || null;
+  return { id: await subId(subUrl), label: subLabel(subUrl), raw, info: parseUserinfo(raw), source: sub.source, stale: !!sub.stale };
+}
+function formatBytes(bytes) {
+  if (bytes >= 1024 ** 4)
+    return `${(bytes / 1024 ** 4).toFixed(2)}T`;
+  if (bytes >= 1024 ** 3)
+    return `${(bytes / 1024 ** 3).toFixed(2)}G`;
+  return `${(bytes / 1024 ** 2).toFixed(0)}M`;
+}
+// Name of the info node shown for one subscription; contains "剩余" so template info groups match it
+function infoNodeName(sub) {
+  const head = `📊 ${sub.label}`;
+  if (sub.source === 'none')
+    return `${head} | 获取失败 剩余 未知`;
+  const { info } = sub;
+  const cached = sub.source === 'cache' ? ' (缓存)' : '';
+  if (!info || !info.total)
+    return `${head} | 剩余 未知(未提供流量信息)${cached}`;
+  const used = (info.upload || 0) + (info.download || 0);
+  const expire = info.expire > 0 ? new Date(info.expire * 1000).toISOString().slice(0, 10) : '长期有效';
+  return `${head} | 已用 ${formatBytes(used)} 剩余 ${formatBytes(Math.max(info.total - used, 0))} 共 ${formatBytes(info.total)} | 到期 ${expire}${cached}`;
+}
+// Unreachable placeholder so health checks never pick it and it carries no traffic
+function infoNode(name) {
+  return { name, type: 'socks5', server: '127.0.0.1', port: 1 };
+}
+// Replace the providers' own notice nodes (剩余流量 / 套餐到期 ...) with one info node per subscription.
+// Info nodes go into the groups that held the notice nodes, or into info-like groups (e.g. 💰 剩余流量).
+function replaceInfoNodes(config, subInfos) {
+  if (!subInfos.length || !Array.isArray(config.proxies))
+    return;
+  const removed = new Set(config.proxies.filter((p) => INFO_NODE_PATTERN.test(p?.name || '')).map((p) => p.name));
+  config.proxies = config.proxies.filter((p) => !removed.has(p?.name));
+  const names = new Set(config.proxies.map((p) => p.name));
+  const nodes = [];
+  for (const sub of subInfos) {
+    let name = infoNodeName(sub);
+    if (names.has(name))
+      name = `${name} #${sub.id}`;
+    names.add(name);
+    nodes.push(infoNode(name));
+  }
+  config.proxies.push(...nodes);
+  const groups = Array.isArray(config['proxy-groups']) ? config['proxy-groups'] : [];
+  let targets = groups.filter((g) => g.proxies?.some((n) => removed.has(n)));
+  if (!targets.length)
+    targets = groups.filter((g) => /剩余|流量|订阅信息|套餐/.test(g.name || ''));
+  for (const group of groups) {
+    if (group.proxies?.some((n) => removed.has(n)))
+      group.proxies = group.proxies.filter((n) => !removed.has(n));
+  }
+  for (const group of targets) {
+    group.proxies = group.proxies || [];
+    for (const node of nodes)
+      if (!group.proxies.includes(node.name))
+        group.proxies.push(node.name);
+  }
 }
 // Provider "nodes" that only carry notices (traffic left, expiry, website...) are not usable proxies.
 // Plain "流量" is deliberately excluded: real node names often contain e.g. "流量倍率:1"
@@ -993,10 +1156,60 @@ function uaFallbacks(env) {
 }
 // Fetch one subscription trying each UA in order until one yields usable nodes; if none does
 // (errors, empty or notice-only content), fall back to the subscription's last good content.
-// Returns { source: 'fresh' | 'cache' | 'none', parsedObj, headers, suspicious, ua }
-async function loadSubscription(subUrl, init, bucket, ctx, uaCandidates = [new Headers(init.headers).get('User-Agent')]) {
+// softDeadlineMs > 0: if fresh content is not ready by then and a cached copy exists, return the
+// cache right away and finish refreshing (and updating the cache) in the background.
+// Returns { source: 'fresh' | 'cache' | 'none', parsedObj, headers, suspicious, ua, stale }
+async function loadSubscription(subUrl, init, bucket, ctx, uaCandidates = [new Headers(init.headers).get('User-Agent')], softDeadlineMs = 0) {
   const host = new URL(subUrl).host;
   const cacheKey = SUB_CACHE_PREFIX + await sha256Hex(subUrl);
+  const cachedPromise = readSubCache(bucket, cacheKey).catch(() => null);
+  const freshPromise = fetchFreshSubscription(subUrl, init, uaCandidates, host);
+  const isUsable = (cached) => cached && Date.now() - cached.cachedAt <= SUB_CACHE_MAX_AGE_MS;
+  const cacheResult = (cached, stale) => ({ source: 'cache', parsedObj: parseData(cached.text), headers: cached.headers, stale });
+  let fresh;
+  if (softDeadlineMs > 0) {
+    const cached = await cachedPromise;
+    if (isUsable(cached)) {
+      const timedOut = Symbol('timeout');
+      const winner = await Promise.race([freshPromise, new Promise((resolve) => setTimeout(() => resolve(timedOut), softDeadlineMs))]);
+      if (winner === timedOut) {
+        console.warn(`[subconvertion] ${host}: soft deadline hit, serving cache and refreshing in background`);
+        ctx.waitUntil(freshPromise.then((f) => f && persistFreshSubscription(f, cached, bucket, cacheKey, host)).catch(() => {}));
+        return cacheResult(cached, true);
+      }
+      fresh = winner;
+    }
+  }
+  fresh ??= await freshPromise;
+  const cached = await cachedPromise;
+  if (fresh) {
+    const suspicious = await persistFreshSubscription(fresh, cached, bucket, cacheKey, host, ctx);
+    return { source: 'fresh', parsedObj: fresh.parsedObj, headers: fresh.headers, suspicious, ua: fresh.ua };
+  }
+  if (isUsable(cached)) {
+    console.warn(`[subconvertion] ${host}: using cached subscription (age ${Math.round((Date.now() - cached.cachedAt) / 1000)}s)`);
+    return cacheResult(cached, false);
+  }
+  return { source: 'none' };
+}
+// A sharp drop (e.g. plan expired, provider glitch) must not overwrite the last good copy,
+// unless that copy is old enough that the drop is likely permanent. Returns whether it was suspicious.
+async function persistFreshSubscription(fresh, cached, bucket, cacheKey, host, ctx) {
+  const { nodeCount } = fresh;
+  const suspicious = !!cached && cached.nodeCount >= 5 && nodeCount < cached.nodeCount * 0.3;
+  if (suspicious)
+    console.warn(`[subconvertion] ${host}: node count dropped ${cached.nodeCount} -> ${nodeCount}`);
+  if (!suspicious || Date.now() - cached.cachedAt > SUB_CACHE_REFRESH_MS) {
+    const write = writeSubCache(bucket, cacheKey, fresh.text, fresh.headers, nodeCount).catch((e) => console.warn(`[subconvertion] sub cache write failed: ${e}`));
+    if (ctx)
+      ctx.waitUntil(write);
+    else
+      await write;
+  }
+  return suspicious;
+}
+// Try each UA until one yields usable nodes. Returns { text, headers, parsedObj, nodeCount, ua } or undefined.
+async function fetchFreshSubscription(subUrl, init, uaCandidates, host) {
   // All attempts share one deadline so a provider that keeps rejecting cannot stall the request
   const deadline = Date.now() + SUB_FETCH_TIMEOUT_MS * 1.5;
   let fresh;
@@ -1028,23 +1241,7 @@ async function loadSubscription(subUrl, init, bucket, ctx, uaCandidates = [new H
       break;
     }
   }
-  const cached = await readSubCache(bucket, cacheKey).catch(() => null);
-  if (fresh) {
-    const { nodeCount } = fresh;
-    // A sharp drop (e.g. plan expired, provider glitch) must not overwrite the last good copy,
-    // unless that copy is old enough that the drop is likely permanent
-    const suspicious = !!cached && cached.nodeCount >= 5 && nodeCount < cached.nodeCount * 0.3;
-    if (suspicious)
-      console.warn(`[subconvertion] ${host}: node count dropped ${cached.nodeCount} -> ${nodeCount}`);
-    if (!suspicious || Date.now() - cached.cachedAt > SUB_CACHE_REFRESH_MS)
-      ctx.waitUntil(writeSubCache(bucket, cacheKey, fresh.text, fresh.headers, nodeCount).catch((e) => console.warn(`[subconvertion] sub cache write failed: ${e}`)));
-    return { source: 'fresh', parsedObj: fresh.parsedObj, headers: fresh.headers, suspicious, ua: fresh.ua };
-  }
-  if (cached && Date.now() - cached.cachedAt <= SUB_CACHE_MAX_AGE_MS) {
-    console.warn(`[subconvertion] ${host}: using cached subscription (age ${Math.round((Date.now() - cached.cachedAt) / 1000)}s)`);
-    return { source: 'cache', parsedObj: parseData(cached.text), headers: cached.headers };
-  }
-  return { source: 'none' };
+  return fresh;
 }
 async function readSubCache(bucket, key) {
   if (typeof bucket?.head !== 'function')
@@ -1124,7 +1321,8 @@ const CACHED_HEADERS = ['content-type', 'content-disposition', 'subscription-use
 // Cache key derived from the full query (subscription URLs, target, template...), hashed so it is unguessable
 async function buildCacheKey(url) {
   const params = [...url.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b));
-  return CACHE_PREFIX + await sha256Hex(url.pathname + '?' + new URLSearchParams(params));
+  // The host is part of the key: cached configs embed absolute URLs of this worker (providers, rulesets)
+  return CACHE_PREFIX + await sha256Hex(url.host + url.pathname + '?' + new URLSearchParams(params));
 }
 async function putCache(bucket, key, body, headers) {
   // Only R2 supports custom metadata; skip caching for KV bindings
