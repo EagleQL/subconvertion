@@ -208,13 +208,14 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
       // 并行抓取所有订阅; 单个订阅失败或内容异常时回落到该订阅上次成功的内容
       // 单订阅节点列表供 provider/面板拉取, 客户端超时短(OpenClash 取订阅信息仅 5 秒): 超过软时限就先回缓存, 后台继续刷新
       const softDeadline = listMode && subFilter ? LIST_SOFT_DEADLINE_MS : 0;
-      const loaded = await Promise.all(urlParts.map((url2) => isHttpUrl(url2)
+      // IP 地址的订阅在 Cloudflare Worker 中无法 fetch, 跳过抓取; provider 模式下由客户端直接拉取
+      const loaded = await Promise.all(urlParts.map((url2) => (isHttpUrl(url2) && !isIpHttpUrl(url2))
         ? loadSubscription(url2, { method: request.method, headers: fetchHeaders }, SUB_BUCKET, ctx, uaCandidates, softDeadline)
         : null));
 
       // 单订阅节点列表且机场返回 mihomo YAML: 直接透传(不经后端), 快且不丢字段
       if (listMode && subFilter && urlParts.length === 1 && isHttpUrl(urlParts[0])
-        && loaded[0].source !== 'none' && loaded[0].parsedObj.format === 'yaml') {
+        && loaded[0]?.source && loaded[0].source !== 'none' && loaded[0].parsedObj.format === 'yaml') {
         const sub = loaded[0];
         if (sub.source === 'cache')
           subCacheHits++;
@@ -239,6 +240,10 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
         let parsedObj;
         if (isHttpUrl(url2)) {
 					suffix = new URL(url2).searchParams?.get('suffix') || suffix;
+          if (isIpHttpUrl(url2)) {
+            subInfos.push(await buildSubInfo(url2, { source: 'direct', ua: primaryUa }, suffix));
+            continue;
+          }
           const sub = loaded[index];
           const subInfo = await buildSubInfo(url2, sub, suffix);
           // Node names as the provider will deliver them, to detect clashes between subscriptions
@@ -1060,6 +1065,18 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
     if (seenNames.has(name))
       name = `${name} #${sub.id}`;
     seenNames.add(name);
+    if (sub.source === 'direct') {
+      // IP subscription: the client fetches it directly; apply its suffix via provider override
+      const directUrl = new URL(sub.url);
+      directUrl.searchParams.delete('suffix');
+      providers[name] = {
+        url: directUrl.href,
+        path: `./proxy_providers/sub-${sub.id}.yaml`,
+        header: { 'User-Agent': [sub.ua || DEFAULT_UA] },
+        ...(sub.suffix && { override: { 'additional-suffix': sub.suffix } }),
+      };
+      continue;
+    }
     const nodes = sub.nodeNames || [];
     const clashes = nodes.some((n) => seenNodes.has(n));
     const marker = clashes ? ` ·${++clashIndex}` : '';
@@ -1136,6 +1153,7 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
     url: providers[name].url,
     path: providers[name].path,
     interval,
+    ...(providers[name].header && { header: providers[name].header }),
     ...(providers[name].override && { override: providers[name].override }),
     // Template-wide node filters (the backend applied them to inline nodes before)
     ...(template?.includeRemarks && { filter: template.includeRemarks }),
@@ -1145,6 +1163,17 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
 }
 function isHttpUrl(link) {
   return link.startsWith("https://") || link.startsWith("http://");
+}
+// Cloudflare Workers cannot fetch IP-literal hosts; in provider mode the client fetches them directly
+function isIpHttpUrl(link) {
+  if (!isHttpUrl(link))
+    return false;
+  try {
+    const host = new URL(link).hostname;
+    return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) || host.startsWith('[');
+  } catch {
+    return false;
+  }
 }
 // Usable node names of a parsed subscription (suffix applied, notice nodes excluded)
 function subscriptionNodeNames(parsedObj, suffix = '', params = null) {
@@ -1160,13 +1189,15 @@ function subscriptionNodeNames(parsedObj, suffix = '', params = null) {
 async function subId(subUrl) {
   return (await sha256Hex(subUrl)).slice(0, 8);
 }
-// host[:port]/path of a subscription with token-like path segments masked (abcd…wxyz)
-function subLabel(subUrl) {
+// host[:port]/path of a subscription with token-like path segments masked, prefixed with [suffix]
+function subLabel(subUrl, suffix = '') {
   const u = new URL(subUrl);
   const path = u.pathname.split('/').filter(Boolean)
     .map((s) => (s.length >= 12 && /^[A-Za-z0-9_-]+$/.test(s) ? `${s.slice(0, 4)}…${s.slice(-4)}` : s))
     .join('/');
-  return path ? `${u.host}/${path}` : u.host;
+  const base = path ? `${u.host}/${path}` : u.host;
+  const tag = (suffix || '').replace(/^[-_\s]+/, '');
+  return tag ? `[${tag}] ${base}` : base;
 }
 function parseUserinfo(value) {
   if (!value)
@@ -1191,8 +1222,8 @@ function aggregateUserinfo(infos) {
 // suffix: the subscription's node-name suffix (e.g. -SsRro-HQ), appended to its info node so the
 // info node joins the same template groups as that subscription's nodes (e.g. ⭐️ HQ 优质节点)
 async function buildSubInfo(subUrl, sub, suffix = '') {
-  const raw = sub.source === 'none' ? null : sub.headers?.get('subscription-userinfo') || null;
-  return { id: await subId(subUrl), label: subLabel(subUrl), raw, info: parseUserinfo(raw), source: sub.source, stale: !!sub.stale, suffix };
+  const raw = sub.source === 'none' || sub.source === 'direct' ? null : sub.headers?.get('subscription-userinfo') || null;
+  return { id: await subId(subUrl), url: subUrl, label: subLabel(subUrl, suffix), raw, info: parseUserinfo(raw), source: sub.source, stale: !!sub.stale, suffix, ua: sub.ua };
 }
 function formatBytes(bytes) {
   if (bytes >= 1024 ** 4)
@@ -1231,6 +1262,9 @@ function replaceInfoNodes(config, subInfos) {
   const names = new Set(config.proxies.map((p) => p.name));
   const nodes = [];
   for (const sub of subInfos) {
+    // IP subscriptions are fetched directly by the client in provider mode (with their own notice nodes)
+    if (sub.source === 'direct')
+      continue;
     let name = infoNodeName(sub);
     if (names.has(name))
       name = `${name} #${sub.id}`;
