@@ -242,7 +242,11 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
         if (isHttpUrl(url2)) {
 					suffix = new URL(url2).searchParams?.get('suffix') || suffix;
           const sub = loaded[index];
-          subInfos.push(await buildSubInfo(url2, sub, suffix));
+          const subInfo = await buildSubInfo(url2, sub, suffix);
+          // Node names as the provider will deliver them, to detect clashes between subscriptions
+          if (sub.source !== 'none')
+            subInfo.nodeNames = subscriptionNodeNames(sub.parsedObj, suffix);
+          subInfos.push(subInfo);
           if (sub.source === 'none') {
             failedSubs++;
             continue;
@@ -1001,12 +1005,25 @@ function escapeRegex(text) {
 function toProviderConfig(config, template, href, interval, subInfos = []) {
   const providers = {};
   const seenNames = new Set();
+  // mihomo keys nodes by name, so same-named nodes from different providers (e.g. two accounts of one
+  // provider) collapse into one. Rename clashing providers' nodes client-side with an override suffix.
+  const seenNodes = new Set();
+  let clashIndex = 1;
   for (const sub of subInfos) {
     let name = sub.label;
     if (seenNames.has(name))
       name = `${name} #${sub.id}`;
     seenNames.add(name);
-    providers[name] = { url: buildProviderUrl(href, sub.id), path: `./proxy_providers/sub-${sub.id}.yaml` };
+    const nodes = sub.nodeNames || [];
+    const clashes = nodes.some((n) => seenNodes.has(n));
+    const marker = clashes ? ` ·${++clashIndex}` : '';
+    for (const n of nodes)
+      seenNodes.add(n + marker);
+    providers[name] = {
+      url: buildProviderUrl(href, sub.id),
+      path: `./proxy_providers/sub-${sub.id}.yaml`,
+      ...(marker && { override: { 'additional-suffix': marker } }),
+    };
   }
   if (!Object.keys(providers).length)
     providers[PROVIDER_NAME] = { url: buildProviderUrl(href), path: `./proxy_providers/${PROVIDER_NAME}.yaml` };
@@ -1073,6 +1090,7 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
     url: providers[name].url,
     path: providers[name].path,
     interval,
+    ...(providers[name].override && { override: providers[name].override }),
     // Template-wide node filters (the backend applied them to inline nodes before)
     ...(template?.includeRemarks && { filter: template.includeRemarks }),
     ...(template?.excludeRemarks && { 'exclude-filter': template.excludeRemarks }),
@@ -1081,6 +1099,15 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
 }
 function isHttpUrl(link) {
   return link.startsWith("https://") || link.startsWith("http://");
+}
+// Usable node names of a parsed subscription (suffix applied, notice nodes excluded)
+function subscriptionNodeNames(parsedObj, suffix = '') {
+  let names = [];
+  if (parsedObj?.format === 'yaml')
+    names = (parsedObj.data?.proxies || []).map((p) => p?.name).filter(Boolean);
+  else if (parsedObj?.format === 'base64')
+    names = parsedObj.data.split(/\r?\n/).map((l) => l.trim()).filter((l) => /^[a-z0-9]+:\/\//i.test(l)).map(nodeNameOfLink);
+  return names.filter((n) => !INFO_NODE_PATTERN.test(n)).map((n) => n + suffix);
 }
 // ---- Per-subscription traffic/expiry info ----
 async function subId(subUrl) {
