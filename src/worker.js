@@ -226,9 +226,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
         const info = await buildSubInfo(urlParts[0], sub, suffix);
         const proxies = cloneWithSuffix(sub.parsedObj.data, suffix).proxies
           .filter((p) => p && !INFO_NODE_PATTERN.test(p.name || ''));
-        if (/^(1|true)$/i.test(url.searchParams.get('udp') || ''))
-          for (const p of proxies)
-            p.udp ??= true;
+        applyNodeDefaults(proxies, url.searchParams);
         proxies.push(infoNode(infoNodeName(info)));
         userinfoOverride = info.raw;
         return respond(jsYaml.dump({ proxies }), { status: 200, headers: { 'Content-Type': 'text/yaml;charset=UTF-8', 'X-Subconvertion-Native': '1' } });
@@ -245,7 +243,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
           const subInfo = await buildSubInfo(url2, sub, suffix);
           // Node names as the provider will deliver them, to detect clashes between subscriptions
           if (sub.source !== 'none')
-            subInfo.nodeNames = subscriptionNodeNames(sub.parsedObj, suffix);
+            subInfo.nodeNames = subscriptionNodeNames(sub.parsedObj, suffix, url.searchParams);
           subInfos.push(subInfo);
           if (sub.source === 'none') {
             failedSubs++;
@@ -325,7 +323,9 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
         return null;
       const base = originalConfigs.find((c) => c["proxy-groups"]) || originalConfigs[0];
       const config = structuredClone(base);
-      fillMissingProxies(config, originalConfigs.filter((c) => c !== base));
+      fillMissingProxies(config, originalConfigs.filter((c) => c !== base), url.searchParams);
+      if (Array.isArray(config.proxies))
+        applyNodeDefaults(config.proxies, url.searchParams);
       replaceInfoNodes(config, subInfos);
       const headers = new Headers({ "Content-Type": "text/yaml;charset=UTF-8", "X-Subconvertion-Fallback": "original" });
       const userInfo = userinfoOverride || firstSubHeaders?.get("subscription-userinfo");
@@ -345,8 +345,6 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
 		// 请求 subConverter 模版转换端点API，获取转换后的数据
     const newUrl = replacedURIs.join("|");
     url.searchParams.set("url", newUrl);
-    // 证书校验跟随机场原始配置(含分享链接里的 allowInsecure), 不让 scv 参数统一改写
-    url.searchParams.delete("scv");
     // ua 只用于抓取机场订阅, 不传给后端
     url.searchParams.delete("ua");
     // provider=true: 输出以代理提供者组织的配置(不内联节点), 节点由 provider 从本服务的节点列表(list=true)拉取
@@ -393,7 +391,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
 					const config = jsYaml.load(result);
 					// 后端不支持的协议(如 anytls / vless reality)会被丢弃, 用原始节点补齐
 					const { restored: filledCount, backfilled } = config && typeof config === 'object'
-						? fillMissingProxies(config, originalConfigs) : { restored: 0, backfilled: 0 };
+						? fillMissingProxies(config, originalConfigs, url.searchParams) : { restored: 0, backfilled: 0 };
 					if (filledCount || backfilled)
 						console.warn(`[subconvertion] restored ${filledCount} node(s), backfilled fields on ${backfilled} node(s)`);
 					// 机场自带的「剩余流量/到期」提示节点换成每个订阅一个的汇总信息节点
@@ -777,8 +775,58 @@ function matchProxies(converted, originals) {
   }
   return matches;
 }
-// Node fields that must follow the provider's original config rather than conversion options
-const PROVIDER_FIELDS = ['skip-cert-verify'];
+// Fields where an explicit value on the original node must win over url options (scv/udp),
+// while nodes that omitted the field still inherit the option.
+const PROVIDER_FIELDS = ['skip-cert-verify', 'udp'];
+const EMOJI_RULES = [
+  [/香港|港|(?<![a-z])hk(?![a-z])|hong ?kong/i, '🇭🇰'],
+  [/台湾|台|台北|(?<![a-z])tw(?![a-z])|taiwan/i, '🇹🇼'],
+  [/日本|东京|大阪|(?<![a-z])jp(?![a-z])|japan/i, '🇯🇵'],
+  [/新加坡|狮城|(?<![a-z])sg(?![a-z])|singapore/i, '🇸🇬'],
+  [/美国|洛杉矶|硅谷|西雅图|圣何塞|芝加哥|(?<![a-z])us(?![a-z])|united states|america/i, '🇺🇸'],
+  [/韩国|韩|首尔|(?<![a-z])kr(?![a-z])|korea/i, '🇰🇷'],
+  [/英国|伦敦|(?<![a-z])(uk|gb)(?![a-z])|united kingdom|england/i, '🇬🇧'],
+  [/德国|法兰克福|(?<![a-z])de(?![a-z])|germany/i, '🇩🇪'],
+  [/法国|巴黎|(?<![a-z])fr(?![a-z])|france/i, '🇫🇷'],
+  [/荷兰|阿姆斯特丹|(?<![a-z])nl(?![a-z])|netherlands/i, '🇳🇱'],
+  [/澳大利亚|澳洲|悉尼|(?<![a-z])au(?![a-z])|australia/i, '🇦🇺'],
+  [/加拿大|多伦多|温哥华|(?<![a-z])ca(?![a-z])|canada/i, '🇨🇦'],
+  [/土耳其|(?<![a-z])tr(?![a-z])|turkey|türkiye/i, '🇹🇷'],
+  [/印度|孟买|(?<![a-z])in(?![a-z])|india/i, '🇮🇳'],
+  [/越南|(?<![a-z])vn(?![a-z])|vietnam/i, '🇻🇳'],
+  [/俄罗斯|莫斯科|(?<![a-z])ru(?![a-z])|russia/i, '🇷🇺'],
+];
+function parseBoolParam(params, key) {
+  const value = params?.get(key);
+  if (/^(1|true)$/i.test(value || ''))
+    return true;
+  if (/^(0|false)$/i.test(value || ''))
+    return false;
+  return undefined;
+}
+function withEmoji(name) {
+  if (!name || /^(?:[\u{1F1E6}-\u{1F1FF}]{2}|🏳️‍🌈|📊|🚥)/u.test(name))
+    return name;
+  const hit = EMOJI_RULES.find(([pattern]) => pattern.test(name));
+  return `${hit ? hit[1] : '🏳️‍🌈'} ${name}`;
+}
+// Apply url options (udp, scv, emoji) to nodes that did not gone through the backend:
+// udp/scv only fill in omitted fields (explicit provider values stay); emoji prefixes a flag.
+function applyNodeDefaults(proxies, params) {
+  if (!params || !proxies?.length)
+    return;
+  const udp = parseBoolParam(params, 'udp');
+  const scv = parseBoolParam(params, 'scv');
+  const emoji = parseBoolParam(params, 'emoji') ?? parseBoolParam(params, 'add_emoji');
+  for (const proxy of proxies) {
+    if (udp !== undefined && proxy.udp == null)
+      proxy.udp = udp;
+    if (scv !== undefined && proxy['skip-cert-verify'] == null)
+      proxy['skip-cert-verify'] = scv;
+    if (emoji && proxy.name)
+      proxy.name = withEmoji(proxy.name);
+  }
+}
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -804,7 +852,7 @@ function regionOf(name) {
 // Reconcile converted nodes with the originals: backfill fields the backend dropped on kept nodes,
 // append nodes the backend dropped entirely and add them to matching proxy-groups.
 // Returns { restored, backfilled } (backfilled = number of nodes that received fields).
-function fillMissingProxies(config, originalConfigs) {
+function fillMissingProxies(config, originalConfigs, params = null) {
   const originals = originalConfigs.flatMap((c) => (Array.isArray(c?.proxies) ? c.proxies : []));
   if (!originals.length)
     return { restored: 0, backfilled: 0 };
@@ -815,13 +863,10 @@ function fillMissingProxies(config, originalConfigs) {
   for (const [original, converted] of matches) {
     if (backfillMissingFields(converted, original))
       backfilled++;
-    // Fields the provider decides: take them verbatim from the original node (absent stays absent)
-    for (const key of PROVIDER_FIELDS) {
-      if (key in original)
+    // Explicit provider values win over backend-applied scv/udp; omitted fields keep the backend's default
+    for (const key of PROVIDER_FIELDS)
+      if (original[key] != null)
         converted[key] = structuredClone(original[key]);
-      else
-        delete converted[key];
-    }
   }
   const existingNames = new Set(config.proxies.map((p) => p.name));
   const realNames = new Set(existingNames);
@@ -843,6 +888,7 @@ function fillMissingProxies(config, originalConfigs) {
     missing.push({ ...proxy, name });
   }
   if (missing.length) {
+    applyNodeDefaults(missing, params);
     config.proxies.push(...missing);
     addToProxyGroups(config, missing, realNames);
   }
@@ -1101,13 +1147,14 @@ function isHttpUrl(link) {
   return link.startsWith("https://") || link.startsWith("http://");
 }
 // Usable node names of a parsed subscription (suffix applied, notice nodes excluded)
-function subscriptionNodeNames(parsedObj, suffix = '') {
+function subscriptionNodeNames(parsedObj, suffix = '', params = null) {
   let names = [];
   if (parsedObj?.format === 'yaml')
     names = (parsedObj.data?.proxies || []).map((p) => p?.name).filter(Boolean);
   else if (parsedObj?.format === 'base64')
     names = parsedObj.data.split(/\r?\n/).map((l) => l.trim()).filter((l) => /^[a-z0-9]+:\/\//i.test(l)).map(nodeNameOfLink);
-  return names.filter((n) => !INFO_NODE_PATTERN.test(n)).map((n) => n + suffix);
+  const emoji = parseBoolParam(params, 'emoji') ?? parseBoolParam(params, 'add_emoji');
+  return names.filter((n) => !INFO_NODE_PATTERN.test(n)).map((n) => (emoji ? withEmoji(n + suffix) : n + suffix));
 }
 // ---- Per-subscription traffic/expiry info ----
 async function subId(subUrl) {
