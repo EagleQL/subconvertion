@@ -24,7 +24,8 @@ const src_default = {
       if (resolved instanceof Response)
         return resolved;
       effective = resolved || request;
-      return await handleRequest(effective, env, ctx);
+      // The short link itself (not the expanded URL) is reused as the provider URL in provider mode
+      return await handleRequest(effective, env, ctx, resolved ? request.url : null);
     } catch (error) {
       // Any unexpected failure: serve the last good result for this query if there is one
       console.error(`[subconvertion] unhandled error: ${error?.stack || error}`);
@@ -81,7 +82,7 @@ function timingSafeEqual(a, b) {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
-async function handleRequest(request, env, ctx) {
+async function handleRequest(request, env, ctx, linkUrl = null) {
     const url = new URL(request.url);
     const host = url.origin;
     const frontendUrl = 'https://raw.githubusercontent.com/bulianglin/psub/main/frontend.html';
@@ -92,6 +93,9 @@ async function handleRequest(request, env, ctx) {
       .filter((b) => b.length > 0);
     const subDir = "subscription";
     const pathSegments = url.pathname.split("/").filter((segment) => segment.length > 0);
+    // 规则集转换透传给后端(依次重试); 配置里的 rule-providers 地址会被改写到这里
+    if (pathSegments[0] === "getruleset")
+      return fetchFromBackends(backends, url.pathname + url.search, request);
     if (pathSegments.length === 0) {
       const response = await fetch(frontendUrl);
       if (response.status !== 200) {
@@ -297,6 +301,11 @@ async function handleRequest(request, env, ctx) {
     url.searchParams.delete("scv");
     // ua 只用于抓取机场订阅, 不传给后端
     url.searchParams.delete("ua");
+    // provider=true: 输出以代理提供者组织的配置(不内联节点), 节点由 provider 从本服务的节点列表(list=true)拉取
+    const providerMode = /^(1|true)$/i.test(url.searchParams.get("provider") || "");
+    const providerInterval = Number(url.searchParams.get("provider_interval")) || DEFAULT_PROVIDER_INTERVAL;
+    url.searchParams.delete("provider");
+    url.searchParams.delete("provider_interval");
     let rpResponse;
     try {
       rpResponse = await fetchFromBackends(backends, url.pathname + url.search, request);
@@ -339,7 +348,9 @@ async function handleRequest(request, env, ctx) {
 						? fillMissingProxies(config, originalConfigs) : { restored: 0, backfilled: 0 };
 					if (filledCount || backfilled)
 						console.warn(`[subconvertion] restored ${filledCount} node(s), backfilled fields on ${backfilled} node(s)`);
-					if (config.proxies?.length) {
+					const hasNodes = !!config.proxies?.length;
+					// 临替节点只用于填补空策略组; 节点列表(list=true)和 provider 模式下不需要
+					if (hasNodes && config["proxy-groups"] && !providerMode) {
 						const callbackNode = { ...config.proxies[0], name: '🚥‼️ 临替节点' };
 						config.proxies.push(callbackNode);
 						// 检查所有的proxy-groups, 如果哪个proxy-group下的proxies字段为空或者只包含DIRECT,则添加一个假的节点
@@ -358,13 +369,21 @@ async function handleRequest(request, env, ctx) {
 							});
 						}
 					}
+					// 后端生成的规则集地址指向它自己的 managed prefix(可能是 127.0.0.1:25500), 改写为本服务的透传地址
+					const rewrittenRulesets = rewriteRuleProviderUrls(config, host);
+					if (rewrittenRulesets)
+						console.warn(`[subconvertion] rewrote ${rewrittenRulesets} rule-provider url(s)`);
+					if (hasNodes && providerMode && config["proxy-groups"]) {
+						const template = await loadGroupTemplate(url.searchParams.get("config"));
+						toProviderConfig(config, template, buildProviderUrl(linkUrl || request.url), providerInterval);
+					}
 					const resultNew = jsYaml.dump(config);
 					const headers = new Headers(rpResponse.headers);
 					if (filledCount)
 						headers.set('X-Subconvertion-Restored', String(filledCount));
 					if (backfilled)
 						headers.set('X-Subconvertion-Backfilled', String(backfilled));
-					if (config.proxies?.length)
+					if (hasNodes)
 						return respond(resultNew, { status: rpResponse.status, statusText: rpResponse.statusText, headers });
 					return new Response(resultNew, { status: rpResponse.status, statusText: rpResponse.statusText, headers });
 				} catch (error) {
@@ -814,6 +833,118 @@ function addToProxyGroups(config, missing, realNames) {
       if (!group.proxies.includes(p.name))
         group.proxies.push(p.name);
   });
+}
+// Point backend-generated ruleset URLs (…/getruleset?…) at this worker, which relays to the backends.
+// Returns the number of rewritten providers.
+function rewriteRuleProviderUrls(config, origin) {
+  let count = 0;
+  for (const provider of Object.values(config?.['rule-providers'] || {})) {
+    if (typeof provider?.url !== 'string')
+      continue;
+    try {
+      const source = new URL(provider.url);
+      if (source.pathname !== '/getruleset' || source.origin === origin)
+        continue;
+      provider.url = `${origin}/getruleset${source.search}`;
+      count++;
+    } catch {
+      // Not a URL; leave untouched
+    }
+  }
+  return count;
+}
+const PROVIDER_NAME = 'subconvertion';
+const DEFAULT_PROVIDER_INTERVAL = 3600;
+const BUILTIN_POLICIES = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE']);
+// Node list endpoint for the provider: same request (short link or long URL) with list=true
+function buildProviderUrl(href) {
+  const providerUrl = new URL(href);
+  providerUrl.searchParams.delete('provider');
+  providerUrl.searchParams.delete('provider_interval');
+  providerUrl.searchParams.set('list', 'true');
+  return providerUrl.href;
+}
+// Parse subconverter custom_proxy_group lines: name`type`members...[`test-url`interval,timeout,tolerance]
+// Members starting with [] reference groups/policies; other members are node-name regexes.
+function parseGroupTemplate(ini) {
+  const groups = new Map();
+  for (const raw of ini.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line.startsWith('custom_proxy_group='))
+      continue;
+    const [name, type, ...members] = line.slice('custom_proxy_group='.length).split('`');
+    const refs = [], filters = [];
+    for (const member of members) {
+      if (member.startsWith('[]'))
+        refs.push(member.slice(2));
+      else if (member && !/^https?:\/\//.test(member) && !/^\d+(,\d*)*$/.test(member))
+        filters.push(member);
+    }
+    groups.set(name, { type, refs, filters });
+  }
+  return groups;
+}
+async function loadGroupTemplate(configUrl) {
+  if (!configUrl || !isHttpUrl(configUrl))
+    return null;
+  try {
+    const response = await fetch(configUrl, { signal: AbortSignal.timeout(10000), cf: { cacheTtl: 3600, cacheEverything: true } });
+    return response.ok ? parseGroupTemplate(await response.text()) : null;
+  } catch (error) {
+    console.warn(`[subconvertion] template fetch failed: ${error}`);
+    return null;
+  }
+}
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+// Rewrite a converted config so groups pull nodes from one proxy-provider instead of inline proxies.
+// Node regexes come from the template so new nodes join the right groups on provider refresh;
+// groups without a template definition fall back to an exact-name filter of their current nodes.
+function toProviderConfig(config, template, providerUrl, interval) {
+  const nodeNames = new Set(config.proxies.map((p) => p.name));
+  const groupNames = new Set(config['proxy-groups'].map((g) => g.name));
+  const isPolicy = (n) => groupNames.has(n) || BUILTIN_POLICIES.has(n);
+  config['proxy-groups'] = config['proxy-groups'].map((group) => {
+    const { proxies = [], ...rest } = group;
+    const definition = template?.get(group.name);
+    const supported = definition && !definition.filters.some((f) => f.startsWith('!!'));
+    let refs, filter, useProvider = false;
+    if (supported) {
+      refs = definition.refs.filter(isPolicy);
+      if (definition.filters.length) {
+        useProvider = true;
+        if (!definition.filters.includes('.*'))
+          filter = definition.filters.map((f) => `(?:${f})`).join('|');
+      }
+    } else {
+      refs = proxies.filter(isPolicy);
+      const nodes = proxies.filter((n) => nodeNames.has(n));
+      if (nodes.length) {
+        useProvider = true;
+        filter = `^(?:${nodes.map(escapeRegex).join('|')})$`;
+      }
+    }
+    const result = { ...rest };
+    if (refs.length || !useProvider)
+      result.proxies = refs.length ? refs : ['DIRECT'];
+    if (useProvider) {
+      result.use = [PROVIDER_NAME];
+      if (filter)
+        result.filter = filter;
+    }
+    return result;
+  });
+  delete config.proxies;
+  config['proxy-providers'] = {
+    [PROVIDER_NAME]: {
+      type: 'http',
+      url: providerUrl,
+      path: `./proxy_providers/${PROVIDER_NAME}.yaml`,
+      interval,
+      'health-check': { enable: true, url: 'http://cp.cloudflare.com/generate_204', interval: 300, lazy: true },
+    },
+  };
 }
 function isHttpUrl(link) {
   return link.startsWith("https://") || link.startsWith("http://");
