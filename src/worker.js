@@ -90,11 +90,19 @@ async function handleRequest(request, env, ctx) {
     let firstSubHeaders;
     // Last fully successful result per request is kept in R2 and served when fetching or converting fails
     const cacheKey = await buildCacheKey(url);
-    let failedSubs = 0;
+    // failedSubs: neither fresh content nor a per-subscription cache was available
+    // subCacheHits: served from the per-subscription cache; degradedSubs: fresh but suspiciously shrunk
+    let failedSubs = 0, subCacheHits = 0, degradedSubs = 0;
     const respond = (body, init) => {
-      if (failedSubs === 0)
-        ctx.waitUntil(putCache(SUB_BUCKET, cacheKey, body, init.headers).catch((e) => console.warn(`[subconvertion] cache write failed: ${e}`)));
-      return new Response(body, init);
+      const headers = new Headers(init.headers);
+      if (subCacheHits)
+        headers.set('X-Subconvertion-Sub-Cache', String(subCacheHits));
+      if (degradedSubs)
+        headers.set('X-Subconvertion-Degraded', String(degradedSubs));
+      // Only a complete, healthy result may replace the last good result
+      if (failedSubs === 0 && degradedSubs === 0)
+        ctx.waitUntil(putCache(SUB_BUCKET, cacheKey, body, headers).catch((e) => console.warn(`[subconvertion] cache write failed: ${e}`)));
+      return new Response(body, { ...init, headers });
     };
 
     if (urlParam.startsWith("proxies:")) {
@@ -114,47 +122,35 @@ async function handleRequest(request, env, ctx) {
       const urlParts = urlParam.split("|").filter((part) => part.trim() !== "");
       if (urlParts.length === 0)
         return new Response("There are no valid links", { status: 400 });
-      let response, parsedObj;
+      const fetchHeaders = new Headers(request.headers);
+      // Keep the client's UA (e.g. clash.meta from OpenClash) so the provider returns full mihomo configs
+      if (!CLASH_UA_PATTERN.test(request.headers.get('User-Agent') || ''))
+        fetchHeaders.set('User-Agent', DEFAULT_UA);
+      // 并行抓取所有订阅; 单个订阅失败或内容异常时回落到该订阅上次成功的内容
+      const loaded = await Promise.all(urlParts.map((url2) => isHttpUrl(url2)
+        ? loadSubscription(url2, { method: request.method, headers: fetchHeaders }, SUB_BUCKET, ctx)
+        : null));
 
-      for (const url2 of urlParts) {
+      for (const [index, url2] of urlParts.entries()) {
         const key = generateRandomStr(11);
 				// e.g.  https://api.xyz.com/?suffix=abc, we need to get 'abc' as the suffix
 				let suffix = url.searchParams.get('suffix') || '';
-        if (url2.startsWith("https://") || url2.startsWith("http://")) {
+        let parsedObj;
+        if (isHttpUrl(url2)) {
 					suffix = new URL(url2).searchParams?.get('suffix') || suffix;
-          const fetchHeaders = new Headers(request.headers);
-          // Keep the client's UA (e.g. clash.meta from OpenClash) so the provider returns full mihomo configs
-          if (!CLASH_UA_PATTERN.test(request.headers.get('User-Agent') || ''))
-            fetchHeaders.set('User-Agent', DEFAULT_UA);
-          let plaintextData;
-          try {
-            // Bound the whole subscription download (headers + body) so a hung provider cannot stall the request
-            response = await fetch(url2, {
-              method: request.method,
-              headers: fetchHeaders,
-              redirect: 'follow', // https://developers.cloudflare.com/workers/runtime-apis/request#constructor
-              signal: AbortSignal.timeout(SUB_FETCH_TIMEOUT_MS),
-            });
-            if (!response.ok) {
-              // console.warn(`[subconvertion] Fetch failed: ${url2}, status: ${response.status}, statusText: ${response.statusText}`);
-              failedSubs++;
-              continue;
-            }
-            plaintextData = await response.text();
-          } catch (error) {
-            console.warn(`[subconvertion] Fetch error: ${new URL(url2).host}, ${error}`);
+          const sub = loaded[index];
+          if (sub.source === 'none') {
             failedSubs++;
             continue;
           }
-          parsedObj = parseData(plaintextData);
-          firstSubHeaders ??= response.headers;
-          await SUB_BUCKET.put(key + "_headers", JSON.stringify(Object.fromEntries(response.headers)));
+          if (sub.source === 'cache')
+            subCacheHits++;
+          if (sub.suspicious)
+            degradedSubs++;
+          parsedObj = sub.parsedObj;
+          firstSubHeaders ??= sub.headers;
+          await SUB_BUCKET.put(key + "_headers", JSON.stringify(Object.fromEntries(sub.headers)));
           keys.push(key);
-          if (!hasNodes(parsedObj)) {
-            console.warn(`[subconvertion] No nodes in response from ${new URL(url2).host}`);
-            failedSubs++;
-            continue;
-          }
         } else {
           parsedObj = parseData(url2);
         }
@@ -163,14 +159,27 @@ async function handleRequest(request, env, ctx) {
           if (newLink)
             replacedURIs.push(newLink);
           continue;
+        } else if (!isHttpUrl(url2) && linkToProxy(url2)) {
+          // Single link of a protocol the backend cannot handle: keep it for restoration
+          originalConfigs.push({ proxies: [linkToProxy(url2)] });
+          continue;
         } else if ("base64" === parsedObj.format) {
           const links = parsedObj.data.split(/\r?\n/).filter((link) => link.trim() !== "");
           const newLinks = [];
+          const extraProxies = [];
           for (const link of links) {
             const newLink = replaceInUri(link, replacements, false, suffix);
             if (newLink)
               newLinks.push(newLink);
+            else {
+              // hysteria2 / tuic / anytls links are not understood by the backend; convert them for restoration
+              const proxy = linkToProxy(link, suffix);
+              if (proxy)
+                extraProxies.push(proxy);
+            }
           }
+          if (extraProxies.length)
+            originalConfigs.push({ proxies: extraProxies });
           const replacedBase64Data = btoa(newLinks.join("\r\n"));
           if (replacedBase64Data) {
 						// 将脱敏后的数据暂存到 KV 中
@@ -198,13 +207,26 @@ async function handleRequest(request, env, ctx) {
         await SUB_BUCKET.delete(key + "_headers");
       }
     };
-    // 所有订阅都抓取失败: 返回上次成功的缓存
-    if (failedSubs > 0 && replacedURIs.length === 0) {
+    // 原始节点直接拼成配置(无模板); 仅对 clash 类目标可用
+    const originalFallback = () => {
+      if (!originalConfigs.length || !/^clash/i.test(url.searchParams.get("target") || ""))
+        return null;
+      const base = originalConfigs.find((c) => c["proxy-groups"]) || originalConfigs[0];
+      const config = structuredClone(base);
+      fillMissingProxies(config, originalConfigs.filter((c) => c !== base));
+      const headers = new Headers({ "Content-Type": "text/yaml;charset=UTF-8", "X-Subconvertion-Fallback": "original" });
+      const userInfo = firstSubHeaders?.get("subscription-userinfo");
+      if (userInfo)
+        headers.set("subscription-userinfo", userInfo);
+      return new Response(jsYaml.dump(config), { status: 200, headers });
+    };
+    // 没有可交给后端转换的节点(全部订阅失败, 或只剩后端不支持的协议)
+    if (replacedURIs.length === 0) {
       await cleanup();
-      const cached = await getCache(SUB_BUCKET, cacheKey);
-      if (cached)
-        return cached;
-      return new Response("All subscriptions failed and no cache is available", { status: 502 });
+      // 有订阅失败时优先用缓存; 否则说明拿到的都是新数据, 直接返回原始节点
+      const cached = failedSubs > 0 || !originalConfigs.length ? await getCache(SUB_BUCKET, cacheKey) : null;
+      const response = cached || originalFallback() || await getCache(SUB_BUCKET, cacheKey);
+      return response || new Response("All subscriptions failed and no cache is available", { status: 502 });
     }
 
 		// 请求 subConverter 模版转换端点API，获取转换后的数据
@@ -292,15 +314,10 @@ async function handleRequest(request, env, ctx) {
 				return cached;
 			}
 			// 后端整体失败(如所有节点都不被支持)时, 对 clash 类目标直接返回原始配置, 保证订阅可用
-			if (originalConfigs.length && /^clash/i.test(url.searchParams.get("target") || "")) {
+			const fallback = originalFallback();
+			if (fallback) {
 				console.warn(`[subconvertion] backend failed (${rpResponse.status}: ${respBody.slice(0, 100)}), falling back to original config`);
-				const config = structuredClone(originalConfigs[0]);
-				fillMissingProxies(config, originalConfigs.slice(1));
-				const headers = new Headers({ "Content-Type": "text/yaml;charset=UTF-8", "X-Subconvertion-Fallback": "original" });
-				const userInfo = firstSubHeaders?.get("subscription-userinfo");
-				if (userInfo)
-					headers.set("subscription-userinfo", userInfo);
-				return new Response(jsYaml.dump(config), { status: 200, headers });
+				return fallback;
 			}
 		}
     return rpResponse;
@@ -653,20 +670,154 @@ function addToProxyGroups(config, missing, realNames) {
         group.proxies.push(p.name);
   });
 }
-function hasNodes(parsedObj) {
+function isHttpUrl(link) {
+  return link.startsWith("https://") || link.startsWith("http://");
+}
+// Provider "nodes" that only carry notices (traffic left, expiry, website...) are not usable proxies.
+// Plain "流量" is deliberately excluded: real node names often contain e.g. "流量倍率:1"
+const INFO_NODE_PATTERN = /剩余|到期|过期|套餐|官网|网址|重置|续费|公告|客服|群组|expire|remaining/i;
+function nodeNameOfLink(link) {
+  const hash = link.indexOf('#');
+  if (hash >= 0) {
+    try { return decodeURIComponent(link.slice(hash + 1)); } catch { return link.slice(hash + 1); }
+  }
+  if (link.startsWith('vmess://')) {
+    try { return JSON.parse(urlSafeBase64Decode(link.slice(8))).ps || ''; } catch { return ''; }
+  }
+  return '';
+}
+// Number of usable nodes in a parsed subscription (notice-only entries excluded)
+function countRealNodes(parsedObj) {
   if (parsedObj.format === 'yaml')
-    return Array.isArray(parsedObj.data?.proxies) && parsedObj.data.proxies.length > 0;
+    return Array.isArray(parsedObj.data?.proxies)
+      ? parsedObj.data.proxies.filter((p) => p?.server && !INFO_NODE_PATTERN.test(p.name || '')).length
+      : 0;
   if (parsedObj.format === 'base64')
-    return /^[a-z0-9]+:\/\//im.test(parsedObj.data);
-  return false;
+    return parsedObj.data.split(/\r?\n/)
+      .filter((l) => /^[a-z0-9]+:\/\//i.test(l.trim()) && !INFO_NODE_PATTERN.test(nodeNameOfLink(l.trim()))).length;
+  return 0;
+}
+const SUB_CACHE_PREFIX = 'subcache/';
+const SUB_CACHE_MAX_AGE_MS = 30 * 24 * 3600 * 1000;
+const SUB_CACHE_REFRESH_MS = 7 * 24 * 3600 * 1000;
+// Fetch one subscription; on failure, empty/notice-only content, fall back to its last good content.
+// Returns { source: 'fresh' | 'cache' | 'none', parsedObj, headers, suspicious }
+async function loadSubscription(subUrl, init, bucket, ctx) {
+  const host = new URL(subUrl).host;
+  const cacheKey = SUB_CACHE_PREFIX + await sha256Hex(subUrl);
+  let fresh;
+  try {
+    // Bound the whole download (headers + body) so a hung provider cannot stall the request
+    const response = await fetch(subUrl, { ...init, redirect: 'follow', signal: AbortSignal.timeout(SUB_FETCH_TIMEOUT_MS) });
+    if (response.ok) {
+      const text = await response.text();
+      fresh = { text, headers: response.headers, parsedObj: parseData(text) };
+    } else {
+      console.warn(`[subconvertion] Fetch failed: ${host}, status: ${response.status}`);
+    }
+  } catch (error) {
+    console.warn(`[subconvertion] Fetch error: ${host}, ${error}`);
+  }
+  const cached = await readSubCache(bucket, cacheKey).catch(() => null);
+  if (fresh) {
+    const nodeCount = countRealNodes(fresh.parsedObj);
+    if (nodeCount > 0) {
+      // A sharp drop (e.g. plan expired, provider glitch) must not overwrite the last good copy,
+      // unless that copy is old enough that the drop is likely permanent
+      const suspicious = !!cached && cached.nodeCount >= 5 && nodeCount < cached.nodeCount * 0.3;
+      if (suspicious)
+        console.warn(`[subconvertion] ${host}: node count dropped ${cached.nodeCount} -> ${nodeCount}`);
+      if (!suspicious || Date.now() - cached.cachedAt > SUB_CACHE_REFRESH_MS)
+        ctx.waitUntil(writeSubCache(bucket, cacheKey, fresh.text, fresh.headers, nodeCount).catch((e) => console.warn(`[subconvertion] sub cache write failed: ${e}`)));
+      return { source: 'fresh', parsedObj: fresh.parsedObj, headers: fresh.headers, suspicious };
+    }
+    console.warn(`[subconvertion] No usable nodes from ${host}`);
+  }
+  if (cached && Date.now() - cached.cachedAt <= SUB_CACHE_MAX_AGE_MS) {
+    console.warn(`[subconvertion] ${host}: using cached subscription (age ${Math.round((Date.now() - cached.cachedAt) / 1000)}s)`);
+    return { source: 'cache', parsedObj: parseData(cached.text), headers: cached.headers };
+  }
+  return { source: 'none' };
+}
+async function readSubCache(bucket, key) {
+  if (typeof bucket?.head !== 'function')
+    return null;
+  const object = await bucket.get(key);
+  if (!object)
+    return null;
+  return {
+    text: await object.text(),
+    headers: new Headers(JSON.parse(object.customMetadata?.headers || '{}')),
+    nodeCount: Number(object.customMetadata?.nodeCount || 0),
+    cachedAt: Number(object.customMetadata?.cachedAt || 0),
+  };
+}
+async function writeSubCache(bucket, key, text, headers, nodeCount) {
+  if (typeof bucket?.head !== 'function')
+    return;
+  const source = new Headers(headers);
+  const kept = Object.fromEntries(CACHED_HEADERS.filter((h) => source.has(h)).map((h) => [h, source.get(h)]));
+  await bucket.put(key, text, { customMetadata: { headers: JSON.stringify(kept), nodeCount: String(nodeCount), cachedAt: String(Date.now()) } });
+}
+// Convert share links of protocols the backend does not support into mihomo proxy objects
+function linkToProxy(link, suffix = '') {
+  let u;
+  try {
+    u = new URL(link.trim());
+  } catch {
+    return;
+  }
+  const scheme = u.protocol.slice(0, -1).toLowerCase();
+  if (!['hysteria2', 'hy2', 'tuic', 'anytls'].includes(scheme) || !u.hostname)
+    return;
+  const q = u.searchParams;
+  const decode = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+  const server = u.hostname.replace(/^\[|\]$/g, '');
+  const port = Number(u.port) || 443;
+  const proxy = { name: `${decode(u.hash.slice(1)) || `${server}:${port}`}${suffix}`, server, port, udp: true };
+  const sni = q.get('sni') || q.get('peer');
+  if (sni)
+    proxy.sni = sni;
+  if (['1', 'true'].includes((q.get('insecure') || q.get('allowInsecure') || q.get('allow_insecure') || '').toLowerCase()))
+    proxy['skip-cert-verify'] = true;
+  if (q.get('alpn'))
+    proxy.alpn = q.get('alpn').split(',');
+  switch (scheme) {
+    case 'hysteria2':
+    case 'hy2':
+      proxy.type = 'hysteria2';
+      proxy.password = decode(u.password ? `${u.username}:${u.password}` : u.username);
+      if (q.get('obfs')) {
+        proxy.obfs = q.get('obfs');
+        proxy['obfs-password'] = q.get('obfs-password') || '';
+      }
+      if (q.get('mport'))
+        proxy.ports = q.get('mport');
+      break;
+    case 'tuic':
+      proxy.type = 'tuic';
+      proxy.uuid = decode(u.username);
+      proxy.password = decode(u.password);
+      proxy['congestion-controller'] = q.get('congestion_control') || 'bbr';
+      proxy['udp-relay-mode'] = q.get('udp_relay_mode') || 'native';
+      break;
+    case 'anytls':
+      proxy.type = 'anytls';
+      proxy.password = decode(u.username);
+      break;
+  }
+  return proxy;
+}
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 const CACHE_PREFIX = 'cache/';
 const CACHED_HEADERS = ['content-type', 'content-disposition', 'subscription-userinfo', 'profile-update-interval', 'profile-web-page-url'];
 // Cache key derived from the full query (subscription URLs, target, template...), hashed so it is unguessable
 async function buildCacheKey(url) {
   const params = [...url.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b));
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(url.pathname + '?' + new URLSearchParams(params)));
-  return CACHE_PREFIX + [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return CACHE_PREFIX + await sha256Hex(url.pathname + '?' + new URLSearchParams(params));
 }
 async function putCache(bucket, key, body, headers) {
   // Only R2 supports custom metadata; skip caching for KV bindings
