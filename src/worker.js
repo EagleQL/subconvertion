@@ -901,6 +901,7 @@ function rewriteRuleProviderUrls(config, origin) {
   return count;
 }
 const PROVIDER_NAME = 'subconvertion';
+const PLACEHOLDER_GROUP = '🚥‼️ 临替节点';
 const DEFAULT_PROVIDER_INTERVAL = 3600;
 const BUILTIN_POLICIES = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE']);
 // Node list endpoint for a provider: same request (short link or long URL) with list=true,
@@ -975,8 +976,13 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
     providers[PROVIDER_NAME] = { url: buildProviderUrl(href), path: `./proxy_providers/${PROVIDER_NAME}.yaml` };
   const providerNames = Object.keys(providers);
   const nodeNames = new Set(config.proxies.map((p) => p.name));
+  // Nodes the providers will actually deliver (template include/exclude applied), to detect empty groups
+  const compile = (pattern) => { try { return pattern ? new RegExp(pattern) : null; } catch { return undefined; } };
+  const include = compile(template?.includeRemarks), exclude = compile(template?.excludeRemarks);
+  const providerNodes = [...nodeNames].filter((n) => (!include || include.test(n)) && !(exclude && exclude.test(n)));
   const groupNames = new Set(config['proxy-groups'].map((g) => g.name));
   const isPolicy = (n) => groupNames.has(n) || BUILTIN_POLICIES.has(n);
+  let placeholderUsed = false;
   config['proxy-groups'] = config['proxy-groups'].map((group) => {
     const { proxies = [], ...rest } = group;
     const definition = template?.groups.get(group.name);
@@ -998,6 +1004,18 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
       }
     }
     const result = { ...rest };
+    // Empty groups would fall back to mihomo's COMPATIBLE (= direct). Like the inline placeholder node,
+    // give them a real proxy instead: a url-test group over all nodes. Only for groups empty right now,
+    // so region groups that do have nodes keep their region semantics.
+    const matcher = useProvider ? compile(filter) : null;
+    const hasOtherOptions = refs.some((n) => n !== 'DIRECT');
+    const emptyFiltered = useProvider && !hasOtherOptions && matcher !== undefined
+      && !providerNodes.some((n) => !matcher || matcher.test(n));
+    const directOnly = !useProvider && (!refs.length || (refs.length === 1 && refs[0] === 'DIRECT')) && !group.name?.includes('全球直连');
+    if (emptyFiltered || directOnly) {
+      refs = [...refs.filter((n) => n !== 'DIRECT'), PLACEHOLDER_GROUP];
+      placeholderUsed = true;
+    }
     if (refs.length || !useProvider)
       result.proxies = refs.length ? refs : ['DIRECT'];
     if (useProvider) {
@@ -1008,6 +1026,11 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
     }
     return result;
   });
+  if (placeholderUsed)
+    config['proxy-groups'].push({
+      name: PLACEHOLDER_GROUP, type: 'url-test', use: [...providerNames],
+      url: 'http://cp.cloudflare.com/generate_204', interval: 300, tolerance: 50, lazy: true,
+    });
   delete config.proxies;
   config['proxy-providers'] = Object.fromEntries(providerNames.map((name) => [name, {
     type: 'http',
