@@ -1,7 +1,36 @@
 import jsYaml from 'js-yaml';
 
+const DEFAULT_UA = 'clash.meta';
+const SUB_FETCH_TIMEOUT_MS = 20000;
+const CLASH_UA_PATTERN = /clash|mihomo|meta|stash/i;
+// Region detection for proxy-group membership; codes are matched only when not surrounded by letters
+const REGION_PATTERNS = [
+  /香港|港|(?<![a-z])hk(?![a-z])|hong ?kong|🇭🇰/i,
+  /台湾|台|(?<![a-z])tw(?![a-z])|taiwan|🇹🇼/i,
+  /日本|东京|大阪|(?<![a-z])jp(?![a-z])|japan|🇯🇵/i,
+  /新加坡|狮城|(?<![a-z])sg(?![a-z])|singapore|🇸🇬/i,
+  /美国|美|洛杉矶|硅谷|西雅图|(?<![a-z])us(?![a-z])|united states|america|🇺🇸/i,
+  /韩国|韩|首尔|(?<![a-z])kr(?![a-z])|korea|🇰🇷/i,
+  /英国|伦敦|(?<![a-z])(uk|gb)(?![a-z])|united kingdom|london|🇬🇧/i,
+  /德国|(?<![a-z])de(?![a-z])|germany|🇩🇪/i,
+];
+
 const src_default = {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    try {
+      return await handleRequest(request, env, ctx);
+    } catch (error) {
+      // Any unexpected failure: serve the last good result for this query if there is one
+      console.error(`[subconvertion] unhandled error: ${error?.stack || error}`);
+      const url = new URL(request.url);
+      const cached = url.searchParams.get("url") ? await getCache(env.SUB_BUCKET, await buildCacheKey(url)).catch(() => null) : null;
+      if (cached)
+        return cached;
+      throw error;
+    }
+  }
+};
+async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
     const host = url.origin;
     const frontendUrl = 'https://raw.githubusercontent.com/bulianglin/psub/main/frontend.html';
@@ -56,10 +85,22 @@ const src_default = {
     const replacements = {};
     const replacedURIs = [];
     const keys = [];
+    // Original (non-desensitized) YAML configs, used to restore nodes the backend drops
+    const originalConfigs = [];
+    let firstSubHeaders;
+    // Last fully successful result per request is kept in R2 and served when fetching or converting fails
+    const cacheKey = await buildCacheKey(url);
+    let failedSubs = 0;
+    const respond = (body, init) => {
+      if (failedSubs === 0)
+        ctx.waitUntil(putCache(SUB_BUCKET, cacheKey, body, init.headers).catch((e) => console.warn(`[subconvertion] cache write failed: ${e}`)));
+      return new Response(body, init);
+    };
 
     if (urlParam.startsWith("proxies:")) {
       const { format, data } = parseData(urlParam.replace(/\|/g, "\r\n"));
       if ("yaml" === format) {
+        originalConfigs.push(cloneWithSuffix(data));
         const key = generateRandomStr(11);
         const replacedYAMLData = replaceYAML(data, replacements);
         if (replacedYAMLData) {
@@ -82,21 +123,38 @@ const src_default = {
         if (url2.startsWith("https://") || url2.startsWith("http://")) {
 					suffix = new URL(url2).searchParams?.get('suffix') || suffix;
           const fetchHeaders = new Headers(request.headers);
-          fetchHeaders.set('User-Agent', 'ClashX Pro/1.118.1.1 (com.west2online.ClashXPro; build:1.118.1.1; macOS 15.4.1) Alamofire/5.8.0');
-          response = await fetch(url2, {
-            method: request.method,
-            headers: fetchHeaders,
-            redirect: 'follow', // https://developers.cloudflare.com/workers/runtime-apis/request#constructor
-          });
-          if (!response.ok) {
-            const respBody = await response.text();
-            // console.warn(`[subconvertion] Fetch failed: ${url2}, status: ${response.status}, statusText: ${response.statusText}, body: ${respBody}`);
+          // Keep the client's UA (e.g. clash.meta from OpenClash) so the provider returns full mihomo configs
+          if (!CLASH_UA_PATTERN.test(request.headers.get('User-Agent') || ''))
+            fetchHeaders.set('User-Agent', DEFAULT_UA);
+          let plaintextData;
+          try {
+            // Bound the whole subscription download (headers + body) so a hung provider cannot stall the request
+            response = await fetch(url2, {
+              method: request.method,
+              headers: fetchHeaders,
+              redirect: 'follow', // https://developers.cloudflare.com/workers/runtime-apis/request#constructor
+              signal: AbortSignal.timeout(SUB_FETCH_TIMEOUT_MS),
+            });
+            if (!response.ok) {
+              // console.warn(`[subconvertion] Fetch failed: ${url2}, status: ${response.status}, statusText: ${response.statusText}`);
+              failedSubs++;
+              continue;
+            }
+            plaintextData = await response.text();
+          } catch (error) {
+            console.warn(`[subconvertion] Fetch error: ${new URL(url2).host}, ${error}`);
+            failedSubs++;
             continue;
           }
-          const plaintextData = await response.text();
           parsedObj = parseData(plaintextData);
+          firstSubHeaders ??= response.headers;
           await SUB_BUCKET.put(key + "_headers", JSON.stringify(Object.fromEntries(response.headers)));
           keys.push(key);
+          if (!hasNodes(parsedObj)) {
+            console.warn(`[subconvertion] No nodes in response from ${new URL(url2).host}`);
+            failedSubs++;
+            continue;
+          }
         } else {
           parsedObj = parseData(url2);
         }
@@ -121,6 +179,8 @@ const src_default = {
             replacedURIs.push(`${host}/${subDir}/${key}`);
           }
         } else if ("yaml" === parsedObj.format) {
+          if (parsedObj.data?.proxies)
+            originalConfigs.push(cloneWithSuffix(parsedObj.data, suffix));
           const replacedYAMLData = replaceYAML(parsedObj.data, replacements, suffix);
           if (replacedYAMLData) {
             await SUB_BUCKET.put(key, replacedYAMLData);
@@ -131,6 +191,22 @@ const src_default = {
       }
     }
 
+    // 无论成功与否都清理暂存数据, 避免脱敏数据残留在 R2
+    const cleanup = async () => {
+      for (const key of keys) {
+        await SUB_BUCKET.delete(key);
+        await SUB_BUCKET.delete(key + "_headers");
+      }
+    };
+    // 所有订阅都抓取失败: 返回上次成功的缓存
+    if (failedSubs > 0 && replacedURIs.length === 0) {
+      await cleanup();
+      const cached = await getCache(SUB_BUCKET, cacheKey);
+      if (cached)
+        return cached;
+      return new Response("All subscriptions failed and no cache is available", { status: 502 });
+    }
+
 		// 请求 subConverter 模版转换端点API，获取转换后的数据
     const newUrl = replacedURIs.join("|");
     url.searchParams.set("url", newUrl);
@@ -138,11 +214,7 @@ const src_default = {
     try {
       rpResponse = await fetchFromBackends(backends, url.pathname + url.search, request);
     } finally {
-      // 无论成功与否都清理暂存数据, 避免脱敏数据残留在 R2
-      for (const key of keys) {
-        await SUB_BUCKET.delete(key);
-        await SUB_BUCKET.delete(key + "_headers");
-      }
+      await cleanup();
     }
     if (rpResponse.status === 200) {
 
@@ -164,6 +236,8 @@ const src_default = {
             newLinks.push(newLink);
         }
         const replacedBase64Data = btoa(newLinks.join("\r\n"));
+        if (newLinks.length)
+          return respond(replacedBase64Data, { status: rpResponse.status, statusText: rpResponse.statusText, headers: rpResponse.headers });
         return new Response(replacedBase64Data, rpResponse);
       } catch (base64Error) {
         let result = plaintextData.replace(
@@ -173,6 +247,10 @@ const src_default = {
 				// 此处拿到的可能是yaml数据,如果是yaml数据,则把placeholderNodes添加到yaml数据中的proxies字段中
 				try {
 					const config = jsYaml.load(result);
+					// 后端不支持的协议(如 anytls / vless reality)会被丢弃, 用原始节点补齐
+					const filledCount = config && typeof config === 'object' ? fillMissingProxies(config, originalConfigs) : 0;
+					if (filledCount)
+						console.warn(`[subconvertion] restored ${filledCount} node(s) dropped by backend`);
 					if (config.proxies?.length) {
 						const callbackNode = { ...config.proxies[0], name: '🚥‼️ 临替节点' };
 						config.proxies.push(callbackNode);
@@ -193,7 +271,12 @@ const src_default = {
 						}
 					}
 					const resultNew = jsYaml.dump(config);
-					return new Response(resultNew, rpResponse);
+					const headers = new Headers(rpResponse.headers);
+					if (filledCount)
+						headers.set('X-Subconvertion-Restored', String(filledCount));
+					if (config.proxies?.length)
+						return respond(resultNew, { status: rpResponse.status, statusText: rpResponse.statusText, headers });
+					return new Response(resultNew, { status: rpResponse.status, statusText: rpResponse.statusText, headers });
 				} catch (error) {
 					// 如果不是yaml数据,则直接返回
 					return new Response(result, rpResponse);
@@ -202,24 +285,49 @@ const src_default = {
     } else {
 			const respBody = await rpResponse.clone().text();
 			// console.error(`[subconvertion] Subscription failed: ${url}, status: ${rpResponse.status}, statusText: ${rpResponse.statusText}, body: ${respBody}`);
+			// 后端失败时优先返回上次成功的缓存(保留模板策略组), 其次返回原始配置
+			const cached = await getCache(SUB_BUCKET, cacheKey);
+			if (cached) {
+				console.warn(`[subconvertion] backend failed (${rpResponse.status}: ${respBody.slice(0, 100)}), serving cached result`);
+				return cached;
+			}
+			// 后端整体失败(如所有节点都不被支持)时, 对 clash 类目标直接返回原始配置, 保证订阅可用
+			if (originalConfigs.length && /^clash/i.test(url.searchParams.get("target") || "")) {
+				console.warn(`[subconvertion] backend failed (${rpResponse.status}: ${respBody.slice(0, 100)}), falling back to original config`);
+				const config = structuredClone(originalConfigs[0]);
+				fillMissingProxies(config, originalConfigs.slice(1));
+				const headers = new Headers({ "Content-Type": "text/yaml;charset=UTF-8", "X-Subconvertion-Fallback": "original" });
+				const userInfo = firstSubHeaders?.get("subscription-userinfo");
+				if (userInfo)
+					headers.set("subscription-userinfo", userInfo);
+				return new Response(jsYaml.dump(config), { status: 200, headers });
+			}
 		}
     return rpResponse;
-  }
-};
+}
 // 依次请求各后端, 返回第一个 200 的响应; 全部失败时返回最后一个响应(或 502)
 async function fetchFromBackends(backends, pathAndSearch, request) {
   const BACKEND_TIMEOUT_MS = 15000;
+  const BACKEND_BODY_TIMEOUT_MS = 20000;
   let lastResponse;
   for (const backend of [...new Set(backends)]) {
+    // Separate budgets for headers and body, so a slow-but-alive large body is not cut off at the header timeout
+    const controller = new AbortController();
+    let timer = setTimeout(() => controller.abort(new Error(`headers timeout after ${BACKEND_TIMEOUT_MS}ms`)), BACKEND_TIMEOUT_MS);
     try {
-      const resp = await fetch(new Request(backend + pathAndSearch, request), {
-        signal: AbortSignal.timeout(BACKEND_TIMEOUT_MS),
-      });
-      if (resp.status === 200)
-        return resp;
+      const resp = await fetch(new Request(backend + pathAndSearch, request), { signal: controller.signal });
+      clearTimeout(timer);
+      if (resp.status === 200) {
+        // Buffer the body here so a broken or stalled stream fails over to the next backend instead of throwing later
+        timer = setTimeout(() => controller.abort(new Error(`body timeout after ${BACKEND_BODY_TIMEOUT_MS}ms`)), BACKEND_BODY_TIMEOUT_MS);
+        const body = await resp.arrayBuffer();
+        clearTimeout(timer);
+        return new Response(body, resp);
+      }
       console.warn(`[subconvertion] backend ${backend} returned ${resp.status}, trying next`);
       lastResponse = resp;
     } catch (error) {
+      clearTimeout(timer);
       console.warn(`[subconvertion] backend ${backend} failed: ${error}, trying next`);
     }
   }
@@ -464,6 +572,120 @@ function replaceYAML(yamlObj, replacements, suffix = '') {
 		proxy.name = proxy.name ? `${proxy.name}${suffix}` : suffix;
   });
   return jsYaml.dump(yamlObj);
+}
+// Deep-copy a parsed config, applying the same name suffix replaceYAML uses
+function cloneWithSuffix(yamlObj, suffix = '') {
+  const copy = structuredClone(yamlObj);
+  if (suffix && Array.isArray(copy?.proxies))
+    copy.proxies.forEach((proxy) => { proxy.name = proxy.name ? `${proxy.name}${suffix}` : suffix; });
+  return copy;
+}
+// Identify a node by its connection endpoint and credential, independent of renaming by the backend
+function proxyKey(proxy) {
+  return `${proxy.server}|${proxy.port}|${proxy.uuid || proxy.password || ''}`;
+}
+function regionOf(name) {
+  return REGION_PATTERNS.find((pattern) => pattern.test(name || ''));
+}
+// Append original nodes missing from config.proxies, and add them to matching proxy-groups.
+// Returns the number of restored nodes.
+function fillMissingProxies(config, originalConfigs) {
+  const originals = originalConfigs.flatMap((c) => (Array.isArray(c?.proxies) ? c.proxies : []));
+  if (!originals.length)
+    return 0;
+  if (!Array.isArray(config.proxies))
+    config.proxies = [];
+  const existingNames = new Set(config.proxies.map((p) => p.name));
+  const realNames = new Set(existingNames);
+  const seenKeys = new Set(config.proxies.map(proxyKey));
+  const missing = [];
+  for (const proxy of originals) {
+    const key = proxyKey(proxy);
+    if (seenKeys.has(key))
+      continue;
+    seenKeys.add(key);
+    let name = proxy.name || 'node';
+    for (let i = 2; existingNames.has(name); i++)
+      name = `${proxy.name} ${i}`;
+    existingNames.add(name);
+    missing.push({ ...proxy, name });
+  }
+  if (!missing.length)
+    return 0;
+  config.proxies.push(...missing);
+  addToProxyGroups(config, missing, realNames);
+  return missing.length;
+}
+function addToProxyGroups(config, missing, realNames) {
+  const groups = Array.isArray(config['proxy-groups']) ? config['proxy-groups'] : [];
+  groups.forEach((group) => {
+    // Provider/filter based groups pick up nodes on their own
+    if (group.use || group['include-all'] || group['include-all-proxies'])
+      return;
+    const members = (group.proxies || []).filter((n) => realNames.has(n));
+    const nameRegion = regionOf(group.name);
+    let toAdd = [];
+    if (realNames.size > 0 && members.length === realNames.size) {
+      // Group contains every remaining node: a region-named group stays region-only, otherwise take all
+      toAdd = nameRegion ? missing.filter((p) => nameRegion.test(p.name)) : missing;
+    } else if (members.length > 0) {
+      // Region group: all current members share one region
+      const region = REGION_PATTERNS.find((pattern) => members.every((n) => pattern.test(n)));
+      if (region)
+        toAdd = missing.filter((p) => region.test(p.name));
+    } else {
+      // Empty group (backend dropped all its nodes): infer region from the group name
+      if (nameRegion)
+        toAdd = missing.filter((p) => nameRegion.test(p.name));
+      else if (realNames.size === 0 && !group.name?.includes('全球直连')
+        && (group.proxies || []).every((n) => n === 'DIRECT'))
+        // Every node was dropped: refill groups that only held built-in placeholders
+        toAdd = missing;
+    }
+    if (!toAdd.length)
+      return;
+    group.proxies = group.proxies || [];
+    // Drop a lone DIRECT placeholder in non-direct groups, mirroring the existing callback-node logic
+    if (!group.name?.includes('全球直连') && group.proxies.length === 1 && group.proxies[0] === 'DIRECT')
+      group.proxies = [];
+    for (const p of toAdd)
+      if (!group.proxies.includes(p.name))
+        group.proxies.push(p.name);
+  });
+}
+function hasNodes(parsedObj) {
+  if (parsedObj.format === 'yaml')
+    return Array.isArray(parsedObj.data?.proxies) && parsedObj.data.proxies.length > 0;
+  if (parsedObj.format === 'base64')
+    return /^[a-z0-9]+:\/\//im.test(parsedObj.data);
+  return false;
+}
+const CACHE_PREFIX = 'cache/';
+const CACHED_HEADERS = ['content-type', 'content-disposition', 'subscription-userinfo', 'profile-update-interval', 'profile-web-page-url'];
+// Cache key derived from the full query (subscription URLs, target, template...), hashed so it is unguessable
+async function buildCacheKey(url) {
+  const params = [...url.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(url.pathname + '?' + new URLSearchParams(params)));
+  return CACHE_PREFIX + [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function putCache(bucket, key, body, headers) {
+  // Only R2 supports custom metadata; skip caching for KV bindings
+  if (typeof bucket?.head !== 'function')
+    return;
+  const source = new Headers(headers);
+  const kept = Object.fromEntries(CACHED_HEADERS.filter((h) => source.has(h)).map((h) => [h, source.get(h)]));
+  await bucket.put(key, body, { customMetadata: { headers: JSON.stringify(kept), cachedAt: String(Date.now()) } });
+}
+async function getCache(bucket, key) {
+  if (typeof bucket?.head !== 'function')
+    return null;
+  const object = await bucket.get(key);
+  if (!object)
+    return null;
+  const headers = new Headers(JSON.parse(object.customMetadata?.headers || '{}'));
+  const ageSeconds = Math.round((Date.now() - Number(object.customMetadata?.cachedAt || Date.now())) / 1000);
+  headers.set('X-Subconvertion-Cache', `hit; age=${ageSeconds}`);
+  return new Response(object.body, { status: 200, headers });
 }
 function urlSafeBase64Encode(input) {
   return btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
