@@ -1020,7 +1020,7 @@ async function relayRuleset(url, backends, bucket, ctx) {
 }
 const PROVIDER_NAME = 'subconvertion';
 const PLACEHOLDER_GROUP = '🚥‼️ 临替节点';
-const DEFAULT_PROVIDER_INTERVAL = 3600;
+const DEFAULT_PROVIDER_INTERVAL = 129600; // 36 hours
 const BUILTIN_POLICIES = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE']);
 // Node list endpoint for a provider: same request (short link or long URL) with list=true,
 // restricted to one subscription by sub=<id>
