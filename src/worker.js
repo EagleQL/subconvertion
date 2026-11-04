@@ -98,6 +98,8 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
     // 规则集转换透传给后端(依次重试); 配置里的 rule-providers 地址会被改写到这里
     if (pathSegments[0] === "getruleset")
       return relayRuleset(url, backends, SUB_BUCKET, ctx);
+    if (pathSegments[0] === "providers" && pathSegments[1] === FIXED_PROVIDER)
+      return fixedProviderResponse(env, url);
     if (pathSegments.length === 0) {
       const response = await fetch(frontendUrl);
       if (response.status !== 200) {
@@ -323,7 +325,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
       }
     };
     // 原始节点直接拼成配置(无模板); 仅对 clash 类目标可用
-    const originalFallback = () => {
+    const originalFallback = async () => {
       if (!originalConfigs.length || !/^clash/i.test(url.searchParams.get("target") || ""))
         return null;
       const base = originalConfigs.find((c) => c["proxy-groups"]) || originalConfigs[0];
@@ -332,6 +334,8 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
       if (Array.isArray(config.proxies))
         applyNodeDefaults(config.proxies, url.searchParams);
       replaceInfoNodes(config, subInfos);
+      const groupTemplate = await loadGroupTemplate(url.searchParams.get("config"));
+      attachFixedProvider(config, groupTemplate, linkUrl || request.url, url.searchParams);
       const headers = new Headers({ "Content-Type": "text/yaml;charset=UTF-8", "X-Subconvertion-Fallback": "original" });
       const userInfo = userinfoOverride || firstSubHeaders?.get("subscription-userinfo");
       if (userInfo)
@@ -343,7 +347,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
       await cleanup();
       // 有订阅失败时优先用缓存; 否则说明拿到的都是新数据, 直接返回原始节点
       const cached = failedSubs > 0 || !originalConfigs.length ? await getCache(SUB_BUCKET, cacheKey) : null;
-      const response = cached || originalFallback() || await getCache(SUB_BUCKET, cacheKey);
+      const response = cached || await originalFallback() || await getCache(SUB_BUCKET, cacheKey);
       return response || new Response("All subscriptions failed and no cache is available", { status: 502 });
     }
 
@@ -402,12 +406,20 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
 					// 机场自带的「剩余流量/到期」提示节点换成每个订阅一个的汇总信息节点
 					if (config && typeof config === 'object')
 						replaceInfoNodes(config, subInfos);
+					const groupTemplate = await loadGroupTemplate(url.searchParams.get("config"));
 					const hasNodes = !!config.proxies?.length;
 					// 临替节点只用于填补空策略组; 节点列表(list=true)和 provider 模式下不需要
+					const fallbackAliases = [];
+					if (hasNodes && config.proxies?.length && !providerMode) {
+						const callbackName = addFallbackAlias(config, config.proxies[0]);
+						if (callbackName)
+							fallbackAliases.push(callbackName);
+						if (!fallbackAliases.includes(PLACEHOLDER_GROUP))
+							fallbackAliases.push(PLACEHOLDER_GROUP);
+					}
+					// 临替节点只用于填补空策略组; 节点列表(list=true)和 provider 模式下不需要
 					if (hasNodes && config["proxy-groups"] && !providerMode) {
-						const callbackNode = { ...config.proxies[0], name: '🚥‼️ 临替节点' };
-						config.proxies.push(callbackNode);
-						// 检查所有的proxy-groups, 如果哪个proxy-group下的proxies字段为空或者只包含DIRECT,则添加一个假的节点
+						// 检查所有的proxy-groups, 如果哪个proxy-group下的proxies字段为空或者只包含DIRECT,则添加临替节点
 						if (config["proxy-groups"]) {
 							config["proxy-groups"].forEach((group) => {
 								if(!group.proxies) {
@@ -418,7 +430,9 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
 									group.proxies = [];
 								}
 								if (group.proxies.length === 0) {
-									group.proxies.push(callbackNode.name);
+									for (const name of fallbackAliases)
+										if (!group.proxies.includes(name))
+											group.proxies.push(name);
 								}
 							});
 						}
@@ -427,10 +441,10 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
 					const rewrittenRulesets = rewriteRuleProviderUrls(config, host);
 					if (rewrittenRulesets)
 						console.warn(`[subconvertion] rewrote ${rewrittenRulesets} rule-provider url(s)`);
-					if (hasNodes && providerMode && config["proxy-groups"]) {
-						const template = await loadGroupTemplate(url.searchParams.get("config"));
-						toProviderConfig(config, template, linkUrl || request.url, providerInterval, subInfos);
-					}
+					if (hasNodes && providerMode && config["proxy-groups"])
+						toProviderConfig(config, groupTemplate, linkUrl || request.url, providerInterval, subInfos, new Set(), fallbackAliases, url.searchParams);
+					else if (config && typeof config === 'object' && config["proxy-groups"])
+						attachFixedProvider(config, groupTemplate, linkUrl || request.url, url.searchParams);
 					const resultNew = jsYaml.dump(config);
 					const headers = new Headers(rpResponse.headers);
 					if (filledCount)
@@ -455,7 +469,7 @@ async function handleRequest(request, env, ctx, linkUrl = null) {
 				return cached;
 			}
 			// 后端整体失败(如所有节点都不被支持)时, 对 clash 类目标直接返回原始配置, 保证订阅可用
-			const fallback = originalFallback();
+			const fallback = await originalFallback();
 			if (fallback) {
 				console.warn(`[subconvertion] backend failed (${rpResponse.status}: ${respBody.slice(0, 100)}), falling back to original config`);
 				return fallback;
@@ -1019,7 +1033,80 @@ async function relayRuleset(url, backends, bucket, ctx) {
   return new Response('All backends failed to provide the ruleset', { status: 502 });
 }
 const PROVIDER_NAME = 'subconvertion';
+const FIXED_PROVIDER = 'phoenix-nolan';
 const PLACEHOLDER_GROUP = '🚥‼️ 临替节点';
+// 临替条目显示成「🚥‼️ 临替节点」加上被复制的那个节点的原名
+function fallbackDisplayName(original) {
+  const name = original || '';
+  if (name.startsWith(PLACEHOLDER_GROUP))
+    return name;
+  return `${PLACEHOLDER_GROUP} ${name}`;
+}
+function fixedProviderUrl(href, params) {
+  const source = new URL(href);
+  const url = new URL(`/providers/${FIXED_PROVIDER}`, source.origin);
+  const parts = source.pathname.split('/').filter(Boolean);
+  if (parts[0] === SHORT_LINK_PREFIX && parts[1])
+    url.searchParams.set('token', parts[1]);
+  for (const key of ['emoji', 'add_emoji', 'udp', 'scv']) {
+    const value = params?.get?.(key);
+    if (value)
+      url.searchParams.set(key, value);
+  }
+  return url.href;
+}
+function fixedProviderResponse(env, url) {
+  const tokens = (env.ACCESS_TOKEN || '').split(',').map((token) => token.trim()).filter(Boolean);
+  const token = url.searchParams.get('token') || '';
+  if (tokens.length && !tokens.some((candidate) => timingSafeEqual(candidate, token)))
+    return new Response('Not Found', { status: 404 });
+  const proxies = expandFixedNodes(parseFixedNodes(env.FIXED_NODES)).map((entry) => entry.proxy);
+  applyNodeDefaults(proxies, url.searchParams);
+  return new Response(jsYaml.dump({ proxies }), {
+    headers: { 'Content-Type': 'text/yaml;charset=UTF-8', 'Cache-Control': 'no-store' },
+  });
+}
+// 按策略模板里的节点名正则把 phoenix-nolan 挂到对应分组，不写死国家。
+// 临替分组使用这个提供者，所以固定节点会全部出现在临替里。
+function attachFixedProvider(config, template, href, params) {
+  if (!config || typeof config !== 'object' || !Array.isArray(config['proxy-groups']))
+    return;
+  config['proxy-providers'] = config['proxy-providers'] || {};
+  config['proxy-providers'][FIXED_PROVIDER] = {
+    type: 'http',
+    url: fixedProviderUrl(href, params),
+    path: `./proxy_providers/${FIXED_PROVIDER}.yaml`,
+    interval: DEFAULT_PROVIDER_INTERVAL,
+    'health-check': { enable: true, url: 'http://cp.cloudflare.com/generate_204', interval: 300, lazy: true },
+  };
+  for (const group of config['proxy-groups']) {
+    if (group.name === PLACEHOLDER_GROUP || group.name?.includes('全球直连'))
+      continue;
+    const definition = template?.groups.get(group.name);
+    if (!definition?.filters.length || definition.filters.some((filter) => filter.startsWith('!!')))
+      continue;
+    group.use = [...new Set([...(group.use || []), FIXED_PROVIDER])];
+    if (!definition.filters.includes('.*') && !group.filter)
+      group.filter = definition.filters.map((filter) => `(?:${filter})`).join('|');
+  }
+  let fallback = config['proxy-groups'].find((group) => group.name === PLACEHOLDER_GROUP);
+  if (!fallback) {
+    fallback = {
+      name: PLACEHOLDER_GROUP, type: 'url-test', use: [],
+      url: 'http://cp.cloudflare.com/generate_204', interval: 300, tolerance: 50, lazy: true,
+    };
+    config['proxy-groups'].push(fallback);
+  }
+  fallback.use = [...new Set([...(fallback.use || []), FIXED_PROVIDER])];
+}
+function addFallbackAlias(config, source) {
+  if (!source?.name)
+    return;
+  const name = fallbackDisplayName(source.name);
+  if (!config.proxies.some((proxy) => proxy.name === name))
+    config.proxies.push({ ...structuredClone(source), name });
+  return name;
+}
 const DEFAULT_PROVIDER_INTERVAL = 129600; // 36 hours
 const BUILTIN_POLICIES = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE']);
 // Node list endpoint for a provider: same request (short link or long URL) with list=true,
@@ -1076,11 +1163,43 @@ async function loadGroupTemplate(configUrl) {
 function escapeRegex(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+// FIXED_NODES is a JSON array of mihomo proxies. Each entry is one server and, unless tiers says
+// otherwise, is emitted twice: the given name for normal groups, and the same name plus -HQ for HQ groups.
+function parseFixedNodes(raw) {
+  if (!raw || !String(raw).trim())
+    return [];
+  try {
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+    return list.filter((node) => node && typeof node === 'object' && node.name && node.server && node.type);
+  } catch (error) {
+    console.warn(`[subconvertion] FIXED_NODES is not valid JSON: ${error}`);
+    return [];
+  }
+}
+function expandFixedNodes(nodes) {
+  const expanded = [];
+  for (const node of nodes) {
+    const tiers = Array.isArray(node.tiers) && node.tiers.length ? node.tiers : ['normal', 'hq'];
+    const proxy = { ...node };
+    delete proxy.tiers;
+    if (tiers.includes('normal'))
+      expanded.push({ proxy: structuredClone(proxy), fallback: true });
+    if (tiers.includes('hq')) {
+      const hqName = /(?:^|-)HQ$/i.test(proxy.name) ? proxy.name : `${proxy.name}-HQ`;
+      if (hqName !== proxy.name)
+        expanded.push({ proxy: { ...structuredClone(proxy), name: hqName }, fallback: false });
+      else if (!tiers.includes('normal'))
+        expanded.push({ proxy: structuredClone(proxy), fallback: false });
+    }
+  }
+  return expanded;
+}
 // Rewrite a converted config so groups pull nodes from proxy-providers (one per subscription, so
 // clients show traffic/expiry per subscription) instead of inline proxies.
 // Node regexes come from the template so new nodes join the right groups on provider refresh;
 // groups without a template definition fall back to an exact-name filter of their current nodes.
-function toProviderConfig(config, template, href, interval, subInfos = []) {
+function toProviderConfig(config, template, href, interval, subInfos = [], fixedNames = new Set(), fallbackNames = [], params = null) {
   const providers = {};
   const seenNames = new Set();
   // mihomo keys nodes by name, so same-named nodes from different providers (e.g. two accounts of one
@@ -1117,15 +1236,16 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
   }
   if (!Object.keys(providers).length)
     providers[PROVIDER_NAME] = { url: buildProviderUrl(href), path: `./proxy_providers/${PROVIDER_NAME}.yaml` };
+  providers[FIXED_PROVIDER] = { url: fixedProviderUrl(href, params), path: `./proxy_providers/${FIXED_PROVIDER}.yaml` };
   const providerNames = Object.keys(providers);
-  const nodeNames = new Set(config.proxies.map((p) => p.name));
+  const fixedList = (config.proxies || []).filter((proxy) => fixedNames.has(proxy.name));
+  const nodeNames = new Set((config.proxies || []).map((proxy) => proxy.name).filter((name) => !fixedNames.has(name)));
   // Nodes the providers will actually deliver (template include/exclude applied), to detect empty groups
   const compile = (pattern) => { try { return pattern ? new RegExp(pattern) : null; } catch { return undefined; } };
   const include = compile(template?.includeRemarks), exclude = compile(template?.excludeRemarks);
   const providerNodes = [...nodeNames].filter((n) => (!include || include.test(n)) && !(exclude && exclude.test(n)));
   const groupNames = new Set(config['proxy-groups'].map((g) => g.name));
   const isPolicy = (n) => groupNames.has(n) || BUILTIN_POLICIES.has(n);
-  let placeholderUsed = false;
   config['proxy-groups'] = config['proxy-groups'].map((group) => {
     const { proxies = [], ...rest } = group;
     const definition = template?.groups.get(group.name);
@@ -1151,13 +1271,23 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
     // give them a real proxy instead: a url-test group over all nodes. Only for groups empty right now,
     // so region groups that do have nodes keep their region semantics.
     const matcher = useProvider ? compile(filter) : null;
+    const fixedMatched = useProvider
+      ? fixedList.filter((proxy) => !filter || (matcher && matcher.test(proxy.name)))
+      : [];
     const hasOtherOptions = refs.some((n) => n !== 'DIRECT');
     const emptyFiltered = useProvider && !hasOtherOptions && matcher !== undefined
-      && !providerNodes.some((n) => !matcher || matcher.test(n));
+      && !providerNodes.some((n) => !matcher || matcher.test(n))
+      && fixedMatched.length === 0;
     const directOnly = !useProvider && (!refs.length || (refs.length === 1 && refs[0] === 'DIRECT')) && !group.name?.includes('全球直连');
     if (emptyFiltered || directOnly) {
       refs = [...refs.filter((n) => n !== 'DIRECT'), PLACEHOLDER_GROUP];
-      placeholderUsed = true;
+      for (const name of fallbackNames)
+        if (!refs.includes(name))
+          refs.push(name);
+    } else {
+      for (const proxy of fixedMatched)
+        if (!refs.includes(proxy.name))
+          refs.push(proxy.name);
     }
     if (refs.length || !useProvider)
       result.proxies = refs.length ? refs : ['DIRECT'];
@@ -1169,12 +1299,23 @@ function toProviderConfig(config, template, href, interval, subInfos = []) {
     }
     return result;
   });
-  if (placeholderUsed)
-    config['proxy-groups'].push({
-      name: PLACEHOLDER_GROUP, type: 'url-test', use: [...providerNames],
+  let fallbackGroup = config['proxy-groups'].find((group) => group.name === PLACEHOLDER_GROUP);
+  if (!fallbackGroup) {
+    fallbackGroup = {
+      name: PLACEHOLDER_GROUP, type: 'url-test',
       url: 'http://cp.cloudflare.com/generate_204', interval: 300, tolerance: 50, lazy: true,
-    });
+    };
+    config['proxy-groups'].push(fallbackGroup);
+  }
+  fallbackGroup.use = [...new Set([...(fallbackGroup.use || []), ...providerNames])];
+  const fallbackAliases = (config.proxies || []).filter((proxy) => fallbackNames.includes(proxy.name));
   delete config.proxies;
+  const kept = [...fixedList];
+  for (const alias of fallbackAliases)
+    if (!kept.some((proxy) => proxy.name === alias.name))
+      kept.push(alias);
+  if (kept.length)
+    config.proxies = kept;
   config['proxy-providers'] = Object.fromEntries(providerNames.map((name) => [name, {
     type: 'http',
     url: providers[name].url,
