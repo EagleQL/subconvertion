@@ -13,7 +13,7 @@ keep_vars = true
 # 逗号分隔, 按顺序尝试, 前一个失败(非 200 / 超时 / 网络错误)则换下一个
 BACKEND = "https://api.v1.mk,https://subapi.cmliussss.net,https://subapi.fxxk.dedyn.io"
 # FIXED_NODES 是固定节点的 JSON 数组，只放在 Cloudflare 的 Worker 变量里，不要写进公开仓库。
-# 未写 tiers 时每个节点会生成普通名和「原名-HQ」两个名字，由模板正则按名字归组，并进入临替分组。
+# 每个节点只保留原名。名字里带 HQ 进 HQ 组，否则进普通组，并进入临替分组。
 
 [[r2_buckets]]
 binding = "SUB_BUCKET"

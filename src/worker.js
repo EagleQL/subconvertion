@@ -1060,7 +1060,7 @@ function fixedProviderResponse(env, url) {
   const token = url.searchParams.get('token') || '';
   if (tokens.length && !tokens.some((candidate) => timingSafeEqual(candidate, token)))
     return new Response('Not Found', { status: 404 });
-  const proxies = expandFixedNodes(parseFixedNodes(env.FIXED_NODES)).map((entry) => entry.proxy);
+  const proxies = expandFixedNodes(parseFixedNodes(env.FIXED_NODES));
   applyNodeDefaults(proxies, url.searchParams);
   return new Response(jsYaml.dump({ proxies }), {
     headers: { 'Content-Type': 'text/yaml;charset=UTF-8', 'Cache-Control': 'no-store' },
@@ -1163,8 +1163,9 @@ async function loadGroupTemplate(configUrl) {
 function escapeRegex(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
-// FIXED_NODES is a JSON array of mihomo proxies. Each entry is one server and, unless tiers says
-// otherwise, is emitted twice: the given name for normal groups, and the same name plus -HQ for HQ groups.
+// FIXED_NODES is a JSON array of mihomo proxies. Each entry is emitted once, under the name
+// stored in the variable. Template regexes do the rest: a name containing HQ joins HQ groups,
+// any other name joins normal groups.
 function parseFixedNodes(raw) {
   if (!raw || !String(raw).trim())
     return [];
@@ -1178,22 +1179,11 @@ function parseFixedNodes(raw) {
   }
 }
 function expandFixedNodes(nodes) {
-  const expanded = [];
-  for (const node of nodes) {
-    const tiers = Array.isArray(node.tiers) && node.tiers.length ? node.tiers : ['normal', 'hq'];
+  return nodes.map((node) => {
     const proxy = { ...node };
     delete proxy.tiers;
-    if (tiers.includes('normal'))
-      expanded.push({ proxy: structuredClone(proxy), fallback: true });
-    if (tiers.includes('hq')) {
-      const hqName = /(?:^|-)HQ$/i.test(proxy.name) ? proxy.name : `${proxy.name}-HQ`;
-      if (hqName !== proxy.name)
-        expanded.push({ proxy: { ...structuredClone(proxy), name: hqName }, fallback: false });
-      else if (!tiers.includes('normal'))
-        expanded.push({ proxy: structuredClone(proxy), fallback: false });
-    }
-  }
-  return expanded;
+    return proxy;
+  });
 }
 // Rewrite a converted config so groups pull nodes from proxy-providers (one per subscription, so
 // clients show traffic/expiry per subscription) instead of inline proxies.
